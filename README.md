@@ -1,4 +1,4 @@
-# Last-Mile Delivery Data Warehouse
+# 🚚Last-Mile Delivery Data Warehouse
 
 A portfolio Data Warehouse project for analyzing last-mile delivery operations, built with the Kimball dimensional modeling methodology.
 
