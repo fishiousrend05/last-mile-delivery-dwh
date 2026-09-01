@@ -1,0 +1,1 @@
+#flows/ingestion_flow.py: Đây là bộ não trung tâm (thường được viết bằng các framework như Prefect hoặc Airflow). File này không chứa logic xử lý dữ liệu, mà nó chứa logic quản lý quy trình. Nó quyết định thứ tự chạy, xử lý lỗi luồng (nếu API sập thì có chạy tiếp phần CSV không), và gửi cảnh báo.

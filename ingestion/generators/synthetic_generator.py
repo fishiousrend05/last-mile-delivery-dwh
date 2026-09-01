@@ -1,0 +1,1 @@
+#Sinh ra các dữ liệu giả lập (mock data) thông qua thư viện như Faker, dùng để test pipeline hoặc bổ sung các dimension còn thiếu.

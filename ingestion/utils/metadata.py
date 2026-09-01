@@ -1,0 +1,1 @@
+#Chịu trách nhiệm ghi lại "nhật ký vận hành" (audit logs). Ví dụ: Job A chạy lúc mấy giờ, kéo được bao nhiêu dòng, có bao nhiêu dòng lỗi.

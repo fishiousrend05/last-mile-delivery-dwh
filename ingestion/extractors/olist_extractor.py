@@ -1,0 +1,1 @@
+#Đọc các file CSV từ data/source/olist/ bằng Pandas hoặc PyArrow. Nó có thể được thiết kế để đọc theo chunk (từng phần nhỏ) để tránh tràn RAM.

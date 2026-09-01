@@ -1,0 +1,1 @@
+# Định nghĩa cách ghi log (in ra terminal hoặc lưu vào file .log). Nó giúp bạn biết luồng chạy đến đâu và lỗi ở dòng nào.

@@ -1,0 +1,1 @@
+#Chứa các hàm tạo connection pool tới PostgreSQL. Thay vì file nào cũng phải viết code kết nối DB, chúng chỉ cần gọi hàm get_db_connection() từ đây.

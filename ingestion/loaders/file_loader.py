@@ -1,0 +1,1 @@
+#Nhận dữ liệu "sạch" từ Validator và thực thi các lệnh SQL (như COPY hoặc INSERT INTO) để đẩy dữ liệu vào schema raw trên Data Warehouse.

@@ -1,0 +1,62 @@
+#Chứa các tham số vận hành như đường dẫn đến thư mục data/source/, URL của API thời tiết, số lượng retry (thử lại) khi gọi API lỗi.
+
+project:
+  name: last-mile-dwh
+  environment: local
+
+storage:
+  raw_path: data/raw
+
+sources:
+  olist:
+    type: file
+    enabled: true
+    source_dir: data/source/olist
+    tables:
+      - orders
+      - order_items
+      - customers
+      - products
+      - sellers
+    load_mode: full_refresh   # Olist là dataset tĩnh, load 1 lần / full refresh
+
+  weather:
+    type: api
+    enabled: true
+    raw_dir: data/raw/weather
+    date_range:
+      start: "2016-09-01"     # khớp khung thời gian dữ liệu Olist
+      end: "2018-10-31"
+    rate_limit_per_minute: 60
+    load_mode: append
+
+  holidays:
+    type: api
+    enabled: true
+    raw_dir: data/raw/holidays
+    country_code: BR          # Olist là dữ liệu Brazil
+    years: [2016, 2017, 2018]
+    load_mode: full_refresh
+
+  synthetic:
+    type: generated
+    enabled: true
+    raw_dir: data/raw/synthetic
+    n_drivers: 200
+    seed: 42                   # cố định seed để tái lập được kết quả
+    load_mode: full_refresh
+
+postgres:
+  schema_landing: landing
+  batch_size: 5000
+
+database:
+  schema: raw
+
+ingestion:
+  batch_size: 10000
+  overwrite_raw: true
+
+logging:
+  level: INFO
+  log_path: logs/ingestion.log

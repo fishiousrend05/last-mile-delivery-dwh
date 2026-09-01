@@ -1,0 +1,1 @@
+#Chứa logic dùng thư viện requests để gọi API thời tiết, xử lý phân trang (pagination) và bóc tách cục diện file JSON trả về.
