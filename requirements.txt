@@ -8,3 +8,5 @@ requests==2.32.3
 pandera==0.19.3       # dùng cho schema_validator
 faker==25.2.0          # dùng cho synthetic_generator
 pytest==8.2.1
+h3
+request
