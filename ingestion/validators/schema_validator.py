@@ -1,4 +1,3 @@
-#Đóng vai trò là "người gác cổng". Nó sẽ nhận dữ liệu từ Extractor, đối chiếu với source_schema.yaml để đảm bảo không có cột nào bị đổi tên hay sai kiểu dữ liệu trước khi đi tiếp.
 """
 validators/schema_validator.py — Generic runner gọi vào các Pandera schema
 đã định nghĩa trong ingestion/schemas/*.py.
@@ -16,7 +15,13 @@ from __future__ import annotations
 import pandas as pd
 import pandera as pa
  
-from ingestion.schemas import holiday_schema, olist_schemas, synthetic_schemas, weather_schema
+from ingestion.schemas import (
+    commercial_event_schema,
+    holiday_schema,
+    olist_schemas,
+    synthetic_schemas,
+    weather_schema,
+)
 from ingestion.utils.logger import get_logger
  
 logger = get_logger(__name__)
@@ -24,13 +29,19 @@ logger = get_logger(__name__)
  
 def _build_registry() -> dict[str, pa.DataFrameSchema]:
     """
-    Gộp SCHEMAS dict từ cả 4 module thành 1 registry duy nhất. Raise ngay
+    Gộp SCHEMAS dict từ cả 5 module thành 1 registry duy nhất. Raise ngay
     lúc import nếu có 2 module lỡ đặt trùng tên bảng — lỗi cấu hình nên bắt
     sớm lúc load module, không để lọt tới lúc validate() rồi mới phát hiện
     validate nhầm schema.
     """
     registry: dict[str, pa.DataFrameSchema] = {}
-    for module in (olist_schemas, weather_schema, holiday_schema, synthetic_schemas):
+    for module in (
+        olist_schemas,
+        weather_schema,
+        holiday_schema,
+        commercial_event_schema,
+        synthetic_schemas,
+    ):
         for table_name, schema in module.SCHEMAS.items():
             if table_name in registry:
                 raise ValueError(

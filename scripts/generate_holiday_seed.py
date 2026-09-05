@@ -2,20 +2,24 @@
 scripts/generate_holiday_seed.py — Gọi Nager.Date API 1 LẦN để sinh
 dbt/seeds/holidays.csv.
  
-QUAN TRỌNG: đây là SCRIPT ONE-OFF, KHÔNG phải extractor chạy định kỳ trong
-Prefect flow (khác weather_extractor.py — thành phần pipeline thật). Theo
-quyết định đã chốt: dim_holiday đã merge vào dim_date, Brazil chỉ cần 3 năm
-holiday cố định (2016-2018) — không có lý do gì để gọi lại API này định kỳ.
+THIẾT KẾ LẠI (v2) — khác bản đầu ở chỗ: KHÔNG chỉ gọi API nữa. Giờ còn đọc
+thêm olist_orders_dataset.csv để tính holiday_impact_tier dựa trên % chênh
+lệch order_count thực tế so với baseline ngày thường (xem
+scripts/event_impact_analysis.py — module dùng chung với
+generate_commercial_events_seed.py).
  
-Vì vậy: KHÔNG đi qua ingestion/extractors/, KHÔNG qua postgres_loader, KHÔNG
-ghi vào landing schema — output đi THẲNG vào dbt/seeds/holidays.csv, dbt tự
-load seed này vào Postgres qua lệnh `dbt seed`.
+Vẫn là SCRIPT ONE-OFF (không thuộc Prefect flow định kỳ) — output đi THẲNG
+vào dbt/seeds/holidays.csv, KHÔNG qua postgres_loader, KHÔNG vào landing schema.
  
-Input:  Nager.Date public API (https://date.nager.at) — không cần API key.
+Input:  Nager.Date public API (https://date.nager.at)
+        data/source/olist/olist_orders_dataset.csv (để tính baseline/tier)
 Output: dbt/seeds/holidays.csv
-        Cột: date, local_name, name, country_code, is_fixed, is_global,
-        holiday_type — khớp đúng holidays_schema trong
-        ingestion/schemas/holiday_schema.py.
+        Cột: date, local_name, name, country_code, holiday_impact_tier
+        (khớp holidays_schema trong ingestion/schemas/holiday_schema.py)
+ 
+LƯU Ý QUAN TRỌNG: chạy script này TRƯỚC generate_commercial_events_seed.py —
+script kia đọc lại dbt/seeds/holidays.csv để loại các ngày lễ khỏi baseline
+"Normal_Day" khi tính commercial_event_tier.
 """
  
 from __future__ import annotations
@@ -29,6 +33,11 @@ import requests
 from ingestion.schemas.holiday_schema import holidays_schema
 from ingestion.utils.logger import get_logger
 from ingestion.validators.api_validator import ApiValidationError, validate_response
+from scripts.event_impact_analysis import (
+    DEFAULT_ORDERS_PATH,
+    compute_event_impact,
+    load_daily_order_counts,
+)
  
 logger = get_logger(__name__)
  
@@ -43,19 +52,6 @@ DEFAULT_OUTPUT_PATH = Path("dbt/seeds/holidays.csv")
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
- 
- 
-def _classify_holiday_type(holiday: dict) -> str:
-    """
-    Map field 'types'/'global' của Nager.Date sang holiday_type tự định nghĩa
-    (national/regional/optional) — cột DERIVED, KHÔNG có sẵn trong response gốc.
-    """
-    types = holiday.get("types", [])
-    if "Optional" in types:
-        return "optional"
-    if holiday.get("global") is True:
-        return "national"
-    return "regional"  # global=False nghĩa là chỉ áp dụng ở 1 số bang (counties)
  
  
 def _fetch_year(year: int, session: requests.Session | None = None) -> list[dict]:
@@ -81,8 +77,6 @@ def _fetch_year(year: int, session: requests.Session | None = None) -> list[dict
                     f"on attempt {attempt}/{MAX_RETRIES}"
                 )
             else:
-                # Lỗi không tạm thời (vd 404 sai country code) -> raise ngay,
-                # không phí lượt retry.
                 validate_response(response, source_name="nager-date")
  
         if attempt < MAX_RETRIES:
@@ -95,10 +89,10 @@ def _fetch_year(year: int, session: requests.Session | None = None) -> list[dict
     )
  
  
-def build_holiday_table(
+def fetch_raw_holidays(
     years: list[int] = YEARS, session: requests.Session | None = None
 ) -> pd.DataFrame:
-    """Gọi Nager.Date cho từng năm, gộp + reshape thành DataFrame khớp holidays_schema."""
+    """Gọi Nager.Date cho từng năm, reshape thành DataFrame (date, local_name, name, country_code)."""
     records = []
     for year in years:
         logger.info(f"Fetching holidays for {COUNTRY_CODE} {year}...")
@@ -110,9 +104,6 @@ def build_holiday_table(
                     "local_name": h["localName"],
                     "name": h["name"],
                     "country_code": h["countryCode"],
-                    "is_fixed": h["fixed"],
-                    "is_global": h["global"],
-                    "holiday_type": _classify_holiday_type(h),
                 }
             )
  
@@ -123,10 +114,28 @@ def build_holiday_table(
  
 def main(
     output_path: Path = DEFAULT_OUTPUT_PATH,
+    orders_path: Path = DEFAULT_ORDERS_PATH,
     years: list[int] = YEARS,
     session: requests.Session | None = None,
 ) -> pd.DataFrame:
-    df = build_holiday_table(years=years, session=session)
+    df = fetch_raw_holidays(years=years, session=session)
+    df["date"] = pd.to_datetime(df["date"])
+ 
+    # Tính holiday_impact_tier từ order_count thực tế — DERIVED, không có
+    # sẵn trong response Nager.Date.
+    daily_orders = load_daily_order_counts(orders_path)
+    baseline_avg, holiday_tier_by_name, _, overlap_dates = compute_event_impact(
+        daily_orders, df[["date", "local_name"]]
+    )
+    df["holiday_impact_tier"] = df["local_name"].map(holiday_tier_by_name).fillna(
+        "Tier_3_Neutral"
+    )
+ 
+    if overlap_dates:
+        logger.warning(
+            f"{len(overlap_dates)} date(s) overlap with commercial events — "
+            f"review COMMERCIAL_EVENTS in scripts/event_impact_analysis.py"
+        )
  
     # Validate NGAY trước khi ghi seed — seed sai sẽ làm dbt build ra dim_date
     # sai mà không có cảnh báo rõ ràng nào, nên chặn lỗi ở đây, không để lọt
@@ -135,7 +144,10 @@ def main(
  
     output_path.parent.mkdir(parents=True, exist_ok=True)
     validated_df.to_csv(output_path, index=False)
-    logger.info(f"Saved holiday seed to {output_path} ({len(validated_df)} row(s))")
+    logger.info(
+        f"Saved holiday seed to {output_path} ({len(validated_df)} row(s), "
+        f"baseline={baseline_avg:.0f} orders/day)"
+    )
  
     return validated_df
  
