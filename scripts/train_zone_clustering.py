@@ -7,7 +7,7 @@ làm INPUT CHUNG cho các module downstream:
     - dbt seed cho dim_zone
  
 Đây là SCRIPT ONE-OFF (không thuộc Prefect flow định kỳ) — chạy tay khi cần
-rebuild lại danh sách zone. Logic dọn lại từ scripts/Dim_zone.ipynb (cell H3 chính
+rebuild lại danh sách zone. Logic dọn lại từ Dim_zone.ipynb (cell H3 chính
 thức), bỏ toàn bộ phần thử nghiệm KMeans/so sánh weather (đã hoàn thành vai
 trò làm bằng chứng cho quyết định chuyển từ KMeans sang H3 res5, không cần
 chạy lại mỗi lần rebuild zone).
@@ -28,15 +28,13 @@ from __future__ import annotations
  
 from pathlib import Path
  
-import h3
 import pandas as pd
  
+from ingestion.utils.geo import RESOLUTION, h3_to_center, latlng_to_h3
 from ingestion.utils.logger import get_logger
 from ingestion.validators.file_validator import validate_file
  
 logger = get_logger(__name__)
- 
-RESOLUTION = 5  # đã chốt: H3 res5 (~10km/cell), thay cho KMeans ban đầu
  
 # Bounding box gần đúng của Brazil — loại nhiễu toạ độ nằm ngoài lãnh thổ,
 # đã phát hiện lúc audit 9 file Olist ở Phase thiết kế.
@@ -45,22 +43,6 @@ BRAZIL_LNG_RANGE = (-75.0, -30.0)
  
 DEFAULT_INPUT_PATH = Path("data/source/olist/olist_geolocation_dataset.csv")
 DEFAULT_OUTPUT_PATH = Path("data/raw/synthetic/zone_centroids.csv")
- 
- 
-def _latlng_to_h3(lat: float, lng: float, resolution: int) -> str:
-    """Tương thích ngược: h3 v4 dùng latlng_to_cell, v3 dùng geo_to_h3."""
-    try:
-        return h3.latlng_to_cell(lat, lng, resolution)
-    except AttributeError:
-        return h3.geo_to_h3(lat, lng, resolution)
- 
- 
-def _h3_to_center(h3_index: str) -> tuple[float, float]:
-    """Tương thích ngược: h3 v4 dùng cell_to_latlng, v3 dùng h3_to_geo."""
-    try:
-        return h3.cell_to_latlng(h3_index)
-    except AttributeError:
-        return h3.h3_to_geo(h3_index)
  
  
 def load_geolocation(input_path: Path) -> pd.DataFrame:
@@ -94,7 +76,7 @@ def build_zone_table(df: pd.DataFrame, resolution: int = RESOLUTION) -> pd.DataF
  
     logger.info(f"Mapping coordinates to H3 index (resolution={resolution})...")
     df_unique["zone_id"] = df_unique.apply(
-        lambda row: _latlng_to_h3(row["geolocation_lat"], row["geolocation_lng"], resolution),
+        lambda row: latlng_to_h3(row["geolocation_lat"], row["geolocation_lng"], resolution),
         axis=1,
     )
  
@@ -118,7 +100,7 @@ def build_zone_table(df: pd.DataFrame, resolution: int = RESOLUTION) -> pd.DataF
     unique_zone_ids = df_unique["zone_id"].unique()
     centroids = pd.DataFrame(
         [
-            {"zone_id": zid, **dict(zip(["centroid_lat", "centroid_lng"], _h3_to_center(zid)))}
+            {"zone_id": zid, **dict(zip(["centroid_lat", "centroid_lng"], h3_to_center(zid)))}
             for zid in unique_zone_ids
         ]
     )
@@ -144,3 +126,4 @@ def main(
  
 if __name__ == "__main__":
     main()
+ 

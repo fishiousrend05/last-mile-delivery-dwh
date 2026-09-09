@@ -1,12 +1,11 @@
-#Chứa các tham số vận hành như đường dẫn đến thư mục data/source/, URL của API thời tiết, số lượng retry (thử lại) khi gọi API lỗi.
-
-project:
-  name: last-mile-dwh
-  environment: local
-
-storage:
-  raw_path: data/raw
-
+# ingestion/config/ingestion_config.yaml
+#
+# Khai báo CÁCH CHẠY từng nguồn cho Prefect flow (ingestion/flows/ingestion_flow.py).
+# Chỉ chứa các nguồn THỰC SỰ chạy qua Extractor -> Validator -> Loader ->
+# Postgres landing schema. Nguồn nào là script one-off (không qua Prefect,
+# không vào landing schema) thì KHÔNG khai báo ở đây — xem ghi chú "holidays"
+# bên dưới để hiểu vì sao.
+ 
 sources:
   olist:
     type: file
@@ -18,8 +17,12 @@ sources:
       - customers
       - products
       - sellers
-    load_mode: full_refresh   # Olist là dataset tĩnh, load 1 lần / full refresh
-
+      - order_payments
+      - order_reviews
+      - geolocation
+      - product_category_translation
+    load_mode: full_refresh   # dataset tĩnh, tải 1 lần / full refresh
+ 
   weather:
     type: api
     enabled: true
@@ -29,15 +32,7 @@ sources:
       end: "2018-10-31"
     rate_limit_per_minute: 60
     load_mode: append
-
-  holidays:
-    type: api
-    enabled: true
-    raw_dir: data/raw/holidays
-    country_code: BR          # Olist là dữ liệu Brazil
-    years: [2016, 2017, 2018]
-    load_mode: full_refresh
-
+ 
   synthetic:
     type: generated
     enabled: true
@@ -45,18 +40,25 @@ sources:
     n_drivers: 200
     seed: 42                   # cố định seed để tái lập được kết quả
     load_mode: full_refresh
-
+ 
+  # --- holidays: KHÔNG còn ở đây kể từ khi đổi thiết kế (xem ghi chú) ---
+  # Holiday + commercial event KHÔNG chạy qua Prefect/Postgres landing.
+  # Đây là 2 SCRIPT ONE-OFF, chạy tay khi cần rebuild, output đi THẲNG vào
+  # dbt seed — không có "raw_dir"/"load_mode" nào áp dụng cho chúng:
+  #
+  #   1. scripts/generate_holiday_seed.py
+  #      -> gọi Nager.Date API + đọc olist_orders_dataset.csv
+  #      -> ghi dbt/seeds/holidays.csv
+  #
+  #   2. scripts/generate_commercial_events_seed.py   (chạy SAU script #1,
+  #      cần đọc lại dbt/seeds/holidays.csv để tính đúng baseline)
+  #      -> ghi dbt/seeds/commercial_events.csv
+  #
+  # Cấu hình dùng chung cho 2 script này (CLEAN_WINDOW, COMMERCIAL_EVENTS,
+  # ngưỡng tier) nằm trong scripts/event_impact_analysis.py, KHÔNG nằm ở
+  # file YAML này — vì đó là logic tính toán (code), không phải tham số môi
+  # trường (config).
+ 
 postgres:
   schema_landing: landing
   batch_size: 5000
-
-database:
-  schema: raw
-
-ingestion:
-  batch_size: 10000
-  overwrite_raw: true
-
-logging:
-  level: INFO
-  log_path: logs/ingestion.log
