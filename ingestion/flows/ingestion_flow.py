@@ -37,8 +37,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+import yaml
 from prefect import flow, get_run_logger, task
 
+import pandas as pd
 from ingestion.extractors.base import ExtractionResult
 from ingestion.extractors import olist_extractor, weather_extractor
 from ingestion.generators import synthetic_generator
@@ -56,6 +58,8 @@ FLOW_NAME = "last-mile-phase-1-ingestion"
 
 OLIST_TABLES = tuple(olist_extractor.OLIST_FILE_MAP.keys())
 
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ingestion_config.yaml"
+
 # Weather extraction is expensive (one API request / zone), therefore retrying
 # the entire Prefect task is deliberately disabled by default. The extractor
 # already performs zone-level retry + partial-failure handling.
@@ -70,17 +74,34 @@ FLOW_TASK_RETRY_DELAY_SECONDS = 30
 # Small helpers
 # ---------------------------------------------------------------------------
 
+def _get_load_mode(source_name: str, default: str) -> str:
+    """
+    Đọc sources.{source_name}.load_mode từ ingestion_config.yaml — để
+    load_mode khai báo trong config THỰC SỰ điều khiển hành vi flow, thay vì
+    chỉ mang tính mô tả trong khi flow tự hardcode giá trị riêng.
+    """
+    if _CONFIG_PATH.exists():
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        load_mode = config.get("sources", {}).get(source_name, {}).get("load_mode")
+        if load_mode:
+            return load_mode
+    return default
+
+
 def _validate_and_load(
     result: ExtractionResult,
     *,
     load_mode: str,
     save_raw: bool = False,
     raw_dir: str | Path | None = None,
-) -> int:
+) -> tuple[int, pd.DataFrame]:
     """
     Common ExtractResult -> validate -> optional raw cache -> PostgreSQL path.
 
-    This function intentionally contains NO transformation logic.
+    Trả về (row_count, validated_df) — validated_df cần thiết cho các bước
+    downstream muốn dùng lại bản đã qua schema contract (vd synthetic dùng
+    lại olist orders/customers đã validate), thay vì tự đọc lại CSV thô.
     """
     validated_df = validate_or_raise(result.df, result.table_name)
 
@@ -92,12 +113,13 @@ def _validate_and_load(
             raw_dir=raw_dir,
         )
 
-    return load_dataframe(
+    row_count = load_dataframe(
         validated_df,
         source_name=result.metadata.get("source_name", "unknown"),
         table_name=result.table_name,
         load_mode=load_mode,
     )
+    return row_count, validated_df
 
 
 def _missing_expected_tables(
@@ -141,12 +163,16 @@ def check_postgres_connection() -> None:
     retries=FLOW_TASK_RETRIES,
     retry_delay_seconds=FLOW_TASK_RETRY_DELAY_SECONDS,
 )
-def ingest_olist() -> dict[str, int]:
+def ingest_olist() -> tuple[dict[str, int], dict[str, pd.DataFrame]]:
     """
     Extract + validate + load toàn bộ 9 bảng Olist.
 
     Olist là nguồn tĩnh và là dependency chính của synthetic delivery_attempts,
     nên flow dùng strict behavior: thiếu bất kỳ bảng nào -> fail task.
+
+    Trả về thêm dict validated_tables (table_name -> DataFrame đã qua
+    schema_validator) để ingest_synthetic() dùng lại đúng bản đã validate,
+    thay vì tự đọc lại CSV thô — nhất quán với cách ingest_weather() đã xử lý.
     """
     logger = get_run_logger()
 
@@ -159,15 +185,19 @@ def ingest_olist() -> dict[str, int]:
             f"Missing table(s): {missing}"
         )
 
+    load_mode = _get_load_mode("olist", default="full_refresh")
+
     loaded: dict[str, int] = {}
+    validated_tables: dict[str, pd.DataFrame] = {}
 
     for result in results:
-        row_count = _validate_and_load(
+        row_count, validated_df = _validate_and_load(
             result,
-            load_mode="full_refresh",
+            load_mode=load_mode,
             save_raw=False,
         )
         loaded[result.table_name] = row_count
+        validated_tables[result.table_name] = validated_df
 
     logger.info(
         "Olist ingestion completed: %d/%d tables, %s total rows",
@@ -175,7 +205,7 @@ def ingest_olist() -> dict[str, int]:
         len(OLIST_TABLES),
         f"{sum(loaded.values()):,}",
     )
-    return loaded
+    return loaded, validated_tables
 
 
 @task(
@@ -207,7 +237,7 @@ def ingest_weather() -> ExtractionResult:
         validated_df,
         source_name="weather",
         table_name="weather_daily",
-        load_mode="append",
+        load_mode=_get_load_mode("weather", default="append"),
     )
 
     failed_zones = result.metadata.get("zones_failed", [])
@@ -239,20 +269,31 @@ def ingest_weather() -> ExtractionResult:
     retries=FLOW_TASK_RETRIES,
     retry_delay_seconds=FLOW_TASK_RETRY_DELAY_SECONDS,
 )
-def ingest_synthetic(weather_result: ExtractionResult) -> dict[str, int]:
+def ingest_synthetic(
+    weather_result: ExtractionResult, olist_validated: dict[str, pd.DataFrame]
+) -> dict[str, int]:
     """
     Generate + validate + load drivers và delivery_attempts.
 
     Synthetic KHÔNG phải dữ liệu REAL: generator đã được thiết kế để neo vào
     Olist thật và weather thật. Flow chỉ truyền dependency vào generator,
     không tự mô phỏng dữ liệu.
+
+    olist_validated: dict từ ingest_olist() — dùng lại orders/customers/
+    geolocation ĐÃ QUA schema_validator, thay vì để synthetic_generator tự
+    đọc lại CSV thô (tránh dùng dữ liệu chưa qua contract, nhất quán với
+    cách weather_df đã được xử lý).
     """
     logger = get_run_logger()
 
     drivers_result, attempts_result = synthetic_generator.main(
+        orders_df=olist_validated["olist_orders"],
+        customers_df=olist_validated["olist_customers"],
+        geolocation_df=olist_validated["olist_geolocation"],
         weather_df=weather_result.df,
     )
 
+    load_mode = _get_load_mode("synthetic", default="full_refresh")
     loaded: dict[str, int] = {}
 
     for result in (drivers_result, attempts_result):
@@ -269,7 +310,7 @@ def ingest_synthetic(weather_result: ExtractionResult) -> dict[str, int]:
             validated_df,
             source_name="synthetic",
             table_name=result.table_name,
-            load_mode="full_refresh",
+            load_mode=load_mode,
         )
         loaded[result.table_name] = row_count
 
@@ -321,14 +362,15 @@ def ingestion_flow() -> dict:
     check_postgres_connection()
 
     # Gate 2: nguồn REAL Olist.
-    olist_summary = ingest_olist()
+    olist_summary, olist_validated = ingest_olist()
 
     # Gate 3: weather REAL/DERIVED từ API. Kết quả được truyền trực tiếp
     # sang synthetic để simulation có weather risk thật.
     weather_result = ingest_weather()
 
-    # Gate 4: synthetic data neo vào REAL/DERIVED inputs.
-    synthetic_summary = ingest_synthetic(weather_result)
+    # Gate 4: synthetic data neo vào REAL/DERIVED inputs — dùng lại
+    # olist_validated thay vì đọc lại CSV thô.
+    synthetic_summary = ingest_synthetic(weather_result, olist_validated)
 
     summary = {
         "flow": FLOW_NAME,
