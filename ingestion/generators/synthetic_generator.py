@@ -441,3 +441,54 @@ def generate_delivery_attempts(
         f"({n_no_carrier:,} excluded — chưa rời kho, ngoài phạm vi last-mile)"
     )
     return ExtractionResult(table_name="delivery_attempts", df=result_df, metadata=metadata)
+ 
+ 
+# ---------------------------------------------------------------------------
+# Orchestration — đọc toàn bộ input từ path mặc định, sinh cả 2 bảng
+# ---------------------------------------------------------------------------
+def main(
+    zone_centroids_path: Path = DEFAULT_ZONE_CENTROIDS_PATH,
+    geolocation_path: Path = DEFAULT_GEOLOCATION_PATH,
+    orders_path: Path = DEFAULT_ORDERS_PATH,
+    customers_path: Path = DEFAULT_CUSTOMERS_PATH,
+    holidays_seed_path: Path = DEFAULT_HOLIDAYS_SEED_PATH,
+    commercial_events_seed_path: Path = DEFAULT_COMMERCIAL_EVENTS_SEED_PATH,
+    weather_df: pd.DataFrame | None = None,
+    n_drivers: int = DEFAULT_N_DRIVERS,
+    seed: int = DEFAULT_SEED,
+) -> tuple[ExtractionResult, ExtractionResult]:
+    """
+    Chạy toàn bộ luồng: đọc input -> generate_drivers() -> map order sang
+    zone -> generate_delivery_attempts(). Trả về 2 ExtractionResult (drivers,
+    delivery_attempts) — Loader nhận thẳng .df của từng cái để ghi Postgres,
+    không cần gọi lại pipeline nội bộ này.
+ 
+    weather_df KHÔNG có path mặc định (khác holidays/commercial_events) vì
+    weather_extractor.py hiện CHƯA ghi ra file CSV trung gian — cần truyền
+    trực tiếp DataFrame đã extract, hoặc để None nếu chưa sẵn sàng (weather
+    risk sẽ tự tắt, có log cảnh báo, KHÔNG raise lỗi).
+    """
+    zone_centroids_df = pd.read_csv(validate_file(zone_centroids_path, ".csv"))
+    geolocation_df = pd.read_csv(validate_file(geolocation_path, ".csv"))
+    orders_df = pd.read_csv(validate_file(orders_path, ".csv"))
+    customers_df = pd.read_csv(validate_file(customers_path, ".csv"))
+ 
+    drivers_result = generate_drivers(zone_centroids_df, n_drivers=n_drivers, seed=seed)
+ 
+    zip_to_zone_df = build_zip_to_zone_map(geolocation_df)
+    orders_zoned_df = map_orders_to_zone(orders_df, customers_df, zip_to_zone_df)
+ 
+    attempts_result = generate_delivery_attempts(
+        orders_zoned_df,
+        drivers_result.df,
+        weather_df=weather_df,
+        holidays_seed_path=holidays_seed_path,
+        commercial_events_seed_path=commercial_events_seed_path,
+        seed=seed,
+    )
+ 
+    return drivers_result, attempts_result
+ 
+ 
+if __name__ == "__main__":
+    main()
