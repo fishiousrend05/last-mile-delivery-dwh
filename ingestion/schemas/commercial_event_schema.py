@@ -17,7 +17,7 @@ JOIN bảng này vào full date spine của dim_date, giống hệt cách xử l
 holidays.csv.
 """
  
-import pandera as pa
+import pandera.pandas as pa
 from pandera import Column, Check
  
 # PHẢI khớp chính xác holiday_schema.IMPACT_TIERS — dùng chung 1 thang đo.

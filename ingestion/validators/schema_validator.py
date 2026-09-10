@@ -13,8 +13,7 @@ riêng bước validate).
 from __future__ import annotations
  
 import pandas as pd
-import pandera as pa
- 
+import pandera.pandas as pa 
 from ingestion.schemas import (
     commercial_event_schema,
     holiday_schema,

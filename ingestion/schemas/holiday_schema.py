@@ -18,7 +18,7 @@ này => is_public_holiday=True). Bảng này chỉ chứa các ngày CÓ lễ, k
 toàn bộ lịch.
 """
  
-import pandera as pa
+import pandera.pandas as pa
 from pandera import Column, Check
  
 # 5 tier — PHẢI khớp chính xác với assign_impact_tier() trong
