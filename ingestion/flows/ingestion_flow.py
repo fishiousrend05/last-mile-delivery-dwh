@@ -357,10 +357,8 @@ def ingestion_flow() -> dict:
         "status": "success",
         "olist": olist_summary,
         "weather": {
-            "rows": len(weather_result.df),
-            "zones_requested": weather_result.metadata.get("zones_requested"),
-            "zones_succeeded": weather_result.metadata.get("zones_succeeded"),
-            "zones_failed": len(weather_result.metadata.get("zones_failed", [])),
+            "rows": len(weather_result),
+            "unique_zones": weather_result["zone_id"].nunique() if not weather_result.empty else 0,
         },
         "synthetic": synthetic_summary,
     }
