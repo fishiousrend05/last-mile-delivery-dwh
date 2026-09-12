@@ -8,18 +8,20 @@ Pipeline:
         -> Schema validation
         -> PostgreSQL landing
 
-    Open-Meteo
-        -> Extract by H3 zone
-        -> Schema validation
-        -> raw/weather CSV cache
-        -> PostgreSQL landing
-
     Synthetic
         -> Generate drivers
-        -> Generate delivery_attempts (neo Olist + weather + seeds)
+        -> Generate delivery_attempts (neo Olist + weather đã có sẵn + seeds)
         -> Schema validation
         -> raw/synthetic CSV cache
         -> PostgreSQL landing
+
+Weather KHÔNG còn chạy trong flow này — xem ingestion/flows/weather_ingestion_flow.py
+(flow riêng, chạy theo lịch). Lý do tách: Open-Meteo free tier quota rất hẹp
+(thực nghiệm ~3 request/70s), fetch đủ ~6800 zone cần nhiều giờ — không nên
+chặn Olist/Synthetic mỗi lần chạy full pipeline chỉ vì đang đợi weather.
+Flow này chỉ ĐỌC LẠI bất kỳ dữ liệu weather nào đã có sẵn trong
+landing.weather_daily tại thời điểm chạy (có thể chưa đầy đủ — synthetic đã
+được thiết kế graceful degradation cho trường hợp này).
 
 Design principles
 -----------------
@@ -42,11 +44,11 @@ from prefect import flow, get_run_logger, task
 
 import pandas as pd
 from ingestion.extractors.base import ExtractionResult
-from ingestion.extractors import olist_extractor, weather_extractor
+from ingestion.extractors import olist_extractor
 from ingestion.generators import synthetic_generator
 from ingestion.loaders.file_loader import save_to_raw_file
-from ingestion.loaders.postgres_loader import load_dataframe
-from ingestion.utils.database import test_connection
+from ingestion.loaders.postgres_loader import get_landing_schema, load_dataframe
+from ingestion.utils.database import get_engine, test_connection
 from ingestion.validators.schema_validator import validate_or_raise
 
 
@@ -60,12 +62,6 @@ OLIST_TABLES = tuple(olist_extractor.OLIST_FILE_MAP.keys())
 
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "ingestion_config.yaml"
 
-# Weather extraction is expensive (one API request / zone), therefore retrying
-# the entire Prefect task is deliberately disabled by default. The extractor
-# already performs zone-level retry + partial-failure handling.
-#
-# We still keep task retries for unexpected process-level failures such as
-# transient infrastructure errors.
 FLOW_TASK_RETRIES = 1
 FLOW_TASK_RETRY_DELAY_SECONDS = 30
 
@@ -209,59 +205,43 @@ def ingest_olist() -> tuple[dict[str, int], dict[str, pd.DataFrame]]:
 
 
 @task(
-    name="ingest-weather",
+    name="load-weather-from-landing",
     retries=FLOW_TASK_RETRIES,
     retry_delay_seconds=FLOW_TASK_RETRY_DELAY_SECONDS,
 )
-def ingest_weather() -> ExtractionResult:
+def load_weather_from_landing() -> pd.DataFrame:
     """
-    Extract toàn bộ weather theo zone -> validate -> raw cache -> landing.
+    Đọc landing.weather_daily HIỆN CÓ trong Postgres — KHÔNG gọi Open-Meteo.
 
-    Weather extractor đã tự xử lý retry ở cấp zone. Vì vậy Prefect không được
-    retry lại toàn bộ hàng nghìn zone chỉ vì một vài zone gặp lỗi tạm thời.
+    Weather được nạp bởi 1 flow RIÊNG, chạy theo lịch độc lập
+    (weather_ingestion_flow.py) — xem docstring đầu module này để hiểu lý do
+    tách. Flow chính chỉ đọc lại bất kỳ dữ liệu nào đã có sẵn tại thời điểm
+    chạy, dùng làm risk factor cho synthetic.
+
+    Nếu bảng chưa tồn tại (weather_ingestion_flow.py chưa từng chạy lần nào)
+    hoặc rỗng, trả về DataFrame rỗng — synthetic_generator đã thiết kế
+    graceful degradation cho trường hợp không có weather_df (tắt risk factor
+    thời tiết, có log cảnh báo, KHÔNG raise lỗi).
     """
     logger = get_run_logger()
+    engine = get_engine()
+    schema = get_landing_schema()
 
-    result = weather_extractor.extract_all()
-
-    validated_df = validate_or_raise(result.df, result.table_name)
-
-    save_to_raw_file(
-        validated_df,
-        source_name="weather",
-        table_name="weather_daily",
-        raw_dir="data/raw/weather",
-    )
-
-    row_count = load_dataframe(
-        validated_df,
-        source_name="weather",
-        table_name="weather_daily",
-        load_mode=_get_load_mode("weather", default="append"),
-    )
-
-    failed_zones = result.metadata.get("zones_failed", [])
-    if failed_zones:
+    try:
+        df = pd.read_sql(f'SELECT * FROM "{schema}"."weather_daily"', engine)
+    except Exception as e:
         logger.warning(
-            "Weather ingestion completed with partial zone failures: "
-            "%d failed zone(s). Loaded %s row(s).",
-            len(failed_zones),
-            f"{row_count:,}",
+            f"Không đọc được {schema}.weather_daily (weather_ingestion_flow.py chưa "
+            f"chạy lần nào, hoặc bảng chưa tồn tại?): {e}. Synthetic sẽ chạy KHÔNG có "
+            f"weather risk factor."
         )
-    else:
-        logger.info(
-            "Weather ingestion completed successfully: %s row(s)",
-            f"{row_count:,}",
+        return pd.DataFrame(
+            columns=["date", "zone_id", "temp_max_c", "temp_min_c", "temp_avg_c", "precipitation_mm", "source"]
         )
 
-    # Trả result gốc để synthetic có thể dùng weather thật làm risk factor.
-    # Validation đã được thực hiện trước khi load; synthetic nhận DataFrame
-    # validated thay vì raw để tránh truyền dữ liệu chưa qua contract.
-    return ExtractionResult(
-        table_name=result.table_name,
-        df=validated_df,
-        metadata=result.metadata,
-    )
+    n_zones = df["zone_id"].nunique() if not df.empty else 0
+    logger.info(f"Đọc {len(df):,} dòng weather từ landing ({n_zones:,} zone) — dùng làm risk factor cho synthetic.")
+    return df
 
 
 @task(
@@ -270,19 +250,19 @@ def ingest_weather() -> ExtractionResult:
     retry_delay_seconds=FLOW_TASK_RETRY_DELAY_SECONDS,
 )
 def ingest_synthetic(
-    weather_result: ExtractionResult, olist_validated: dict[str, pd.DataFrame]
+    weather_df: pd.DataFrame, olist_validated: dict[str, pd.DataFrame]
 ) -> dict[str, int]:
     """
     Generate + validate + load drivers và delivery_attempts.
 
     Synthetic KHÔNG phải dữ liệu REAL: generator đã được thiết kế để neo vào
-    Olist thật và weather thật. Flow chỉ truyền dependency vào generator,
+    Olist thật và weather thật (dù có thể chưa đầy đủ — xem
+    load_weather_from_landing()). Flow chỉ truyền dependency vào generator,
     không tự mô phỏng dữ liệu.
 
     olist_validated: dict từ ingest_olist() — dùng lại orders/customers/
     geolocation ĐÃ QUA schema_validator, thay vì để synthetic_generator tự
-    đọc lại CSV thô (tránh dùng dữ liệu chưa qua contract, nhất quán với
-    cách weather_df đã được xử lý).
+    đọc lại CSV thô.
     """
     logger = get_run_logger()
 
@@ -290,7 +270,7 @@ def ingest_synthetic(
         orders_df=olist_validated["olist_orders"],
         customers_df=olist_validated["olist_customers"],
         geolocation_df=olist_validated["olist_geolocation"],
-        weather_df=weather_result.df,
+        weather_df=weather_df,
     )
 
     load_mode = _get_load_mode("synthetic", default="full_refresh")
@@ -366,7 +346,7 @@ def ingestion_flow() -> dict:
 
     # Gate 3: weather REAL/DERIVED từ API. Kết quả được truyền trực tiếp
     # sang synthetic để simulation có weather risk thật.
-    weather_result = ingest_weather()
+    weather_result = load_weather_from_landing()
 
     # Gate 4: synthetic data neo vào REAL/DERIVED inputs — dùng lại
     # olist_validated thay vì đọc lại CSV thô.
