@@ -49,6 +49,7 @@ logs/*
 dbt/target/
 dbt/logs/
 dbt/dbt_packages/
+dbt/seeds/*
 
 # Local dbt profile may contain credentials
 dbt/profiles.yml
