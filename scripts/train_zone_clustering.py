@@ -13,7 +13,7 @@ trò làm bằng chứng cho quyết định chuyển từ KMeans sang H3 res5, 
 chạy lại mỗi lần rebuild zone).
  
 Input:  data/source/olist/olist_geolocation_dataset.csv
-Output: data/raw/synthetic/zone_centroids.csv
+Output: dbt/seeds/zone_centroids.csv
         Cột: zone_id, centroid_lat, centroid_lng, point_count, dominant_state
  
 "point_count" tính trên TOÀN BỘ điểm gốc (chưa dedup) join lại theo zone —
@@ -42,7 +42,7 @@ BRAZIL_LAT_RANGE = (-35.0, 5.0)
 BRAZIL_LNG_RANGE = (-75.0, -30.0)
  
 DEFAULT_INPUT_PATH = Path("data/source/olist/olist_geolocation_dataset.csv")
-DEFAULT_OUTPUT_PATH = Path("data/raw/synthetic/zone_centroids.csv")
+DEFAULT_OUTPUT_PATH = Path("dbt/seeds/zone_centroids.csv")
  
  
 def load_geolocation(input_path: Path) -> pd.DataFrame:

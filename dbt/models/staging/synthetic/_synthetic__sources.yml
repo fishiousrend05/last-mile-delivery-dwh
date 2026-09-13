@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: landing_synthetic
+    database: last_mile_dwh
+    schema: landing
+    tables:
+      - name: delivery_attempts
+      - name: drivers

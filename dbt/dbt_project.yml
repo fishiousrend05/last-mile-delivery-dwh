@@ -1,0 +1,46 @@
+name: 'last_mile_dwh'
+version: '1.0.0'
+config-version: 2
+
+# Trỏ chính xác vào tên profile đã định nghĩa trong ~/.dbt/profiles.yml
+profile: 'last_mile_dwh'
+
+# Khai báo các thư mục làm việc tiêu chuẩn của dbt
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# ==============================================================================
+# CẤU HÌNH THƯ MỤC MODELS
+# ==============================================================================
+models:
+  last_mile_dwh:
+    # 1. Cấu hình cho toàn bộ file SQL trong thư mục models/staging/
+    staging:
+      +materialized: view
+      +schema: staging # Hậu tố schema: các view sẽ được lưu vào schema "public_staging" (hoặc tên tương tự tuỳ môi trường)
+      
+    # 2. Cấu hình sẵn cho Phase sau (để trống thư mục cũng không sao)
+    intermediate:
+      +materialized: table
+      +schema: intermediate
+      
+    marts:
+      +materialized: table
+      +schema: marts
+
+# ==============================================================================
+# CẤU HÌNH THƯ MỤC SEEDS
+# ==============================================================================
+seeds:
+  last_mile_dwh:
+    # Nơi chứa .csv
+    +schema: seeds
