@@ -42,5 +42,13 @@ models:
 # ==============================================================================
 seeds:
   last_mile_dwh:
-    # Nơi chứa .csv
     +schema: seeds
+    holidays:
+      +column_types:
+        date: date
+    commercial_events:
+      +column_types:
+        date: date
+    zone_centroids:
+      +column_types:
+        zone_id: varchar

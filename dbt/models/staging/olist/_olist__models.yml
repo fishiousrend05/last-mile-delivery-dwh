@@ -1,0 +1,13 @@
+version: 2
+
+models:
+  - name: stg_olist__product_category_translation
+    description: "Bảng chuẩn hóa tên danh mục sản phẩm từ tiếng Bồ Đào Nha sang tiếng Anh."
+    columns:
+      - name: product_category_name
+        description: "Tên danh mục tiếng Bồ Đào Nha (Primary Key)"
+        tests:
+          - unique
+          - not_null
+      - name: product_category_name_english
+        description: "Tên danh mục tiếng Anh"

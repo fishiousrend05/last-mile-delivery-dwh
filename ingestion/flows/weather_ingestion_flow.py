@@ -141,6 +141,6 @@ if __name__ == "__main__":
         # Chạy theo lịch qua chính Prefect (không cần cron của OS — tiện hơn
         # trên Windows, nơi cron không có sẵn). Mặc định mỗi giờ 1 lần;
         # đổi lại biểu thức cron này nếu muốn chạy dày/thưa hơn.
-        weather_ingestion_flow.serve(name="weather-hourly", cron="*/5 * * * *")
+        weather_ingestion_flow.serve(name="weather-hourly", cron="*/15 * * * *")
     else:
         weather_ingestion_flow()
