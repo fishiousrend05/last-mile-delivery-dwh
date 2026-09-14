@@ -27,6 +27,7 @@ single connection factory used by the ingestion project.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,12 +38,19 @@ from ingestion.utils.database import get_engine
 from ingestion.utils.logger import get_logger
 from ingestion.utils.metadata import (
     end_run,
-    get_last_run_status,
+    get_running_since,
     init_metadata_table,
     start_run,
 )
 
 logger = get_logger(__name__)
+
+# Nếu lock 'running' đã tồn tại LÂU HƠN ngưỡng này, coi là TREO (crash cũ
+# không kịp gọi end_run()), không phải run thật đang chạy -> tự phục hồi
+# thay vì chặn vĩnh viễn. 30 phút đủ dài cho mọi load thật của project này
+# (kể cả olist_geolocation ~1M dòng cũng chỉ mất ~1 phút), đủ ngắn để không
+# che giấu 1 lock thật đang chạy quá lâu bất thường.
+STALE_RUNNING_THRESHOLD_MINUTES = 5
 
 _CONFIG_PATH = (
     Path(__file__).resolve().parents[1] / "config" / "ingestion_config.yaml"
@@ -239,10 +247,19 @@ def load_dataframe(
     init_metadata_table()
 
     if prevent_concurrent_load:
-        previous_status = get_last_run_status(source_name, table_name)
-        if previous_status == "running":
-            raise ConcurrentLoadError(
-                f"A load for {source_name}.{table_name} is already running."
+        running_since = get_running_since(source_name, table_name)
+        if running_since is not None:
+            age_minutes = (datetime.now(timezone.utc) - running_since).total_seconds() / 60
+            if age_minutes < STALE_RUNNING_THRESHOLD_MINUTES:
+                raise ConcurrentLoadError(
+                    f"A load for {source_name}.{table_name} started "
+                    f"{age_minutes:.1f} min ago and is still marked 'running'."
+                )
+            logger.warning(
+                f"Found a 'running' audit row for {source_name}.{table_name} that is "
+                f"{age_minutes:.1f} min old (> {STALE_RUNNING_THRESHOLD_MINUTES} min "
+                f"threshold) — treating as a STALE lock from a crashed run (Ctrl+C/kill), "
+                f"NOT a real concurrent load. Proceeding."
             )
 
     run_id = start_run(source_name, table_name, mode)

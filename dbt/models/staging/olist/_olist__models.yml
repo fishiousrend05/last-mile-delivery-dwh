@@ -11,3 +11,69 @@ models:
           - not_null
       - name: product_category_name_english
         description: "Tên danh mục tiếng Anh"
+
+  - name: stg_olist__orders
+    description: "Bảng cốt lõi chứa thông tin đơn hàng Olist"
+    columns:
+      - name: order_id
+        description: "Mã đơn hàng (Primary Key)"
+        tests:
+          - unique
+          - not_null
+      - name: order_status
+        description: "Trạng thái đơn hàng"
+        tests:
+          - accepted_values:
+              values: ['delivered', 'shipped', 'canceled', 'unavailable', 'invoiced', 'processing', 'created', 'approved']
+
+
+  - name: stg_olist__order_items
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+      - name: order_item_id
+        tests:
+          - not_null
+
+  - name: stg_olist__customers
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_olist__sellers
+    columns:
+      - name: seller_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_olist__products
+    columns:
+      - name: product_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_olist__geolocation
+    columns:
+      - name: zip_code_prefix
+        tests:
+          - unique
+          - not_null
+  - name: stg_olist__order_payments
+    columns:
+      - name: order_id
+        tests:
+          - not_null
+
+  - name: stg_olist__order_reviews
+    columns:
+      - name: review_id
+        tests:
+          - not_null
+      - name: order_id
+        tests:
+          - not_null

@@ -141,6 +141,15 @@ if __name__ == "__main__":
         # Chạy theo lịch qua chính Prefect (không cần cron của OS — tiện hơn
         # trên Windows, nơi cron không có sẵn). Mặc định mỗi giờ 1 lần;
         # đổi lại biểu thức cron này nếu muốn chạy dày/thưa hơn.
-        weather_ingestion_flow.serve(name="weather-hourly", cron="*/15 * * * *")
+        #
+        # global_limit=1 CỰC KỲ QUAN TRỌNG: nếu process bị start/stop nhiều
+        # lần (vd tắt máy đi ngủ, mở lại hôm sau), Prefect scheduler sẽ thấy
+        # nhiều lần chạy "Late" bị dồn ứ và có xu hướng bung HẾT ra cùng lúc
+        # khi khởi động lại — nhiều instance cùng gọi Open-Meteo + cùng ghi
+        # checkpoint file đồng thời sẽ gây 429 dồn dập VÀ có thể làm hỏng
+        # checkpoint (race condition ghi file). global_limit=1 đảm bảo CHỈ
+        # 1 flow run được thực thi tại 1 thời điểm, các "Late" run khác phải
+        # đợi tới lượt tuần tự.
+        weather_ingestion_flow.serve(name="weather-hourly", cron="0 */6 * * *", global_limit=1)
     else:
         weather_ingestion_flow()
