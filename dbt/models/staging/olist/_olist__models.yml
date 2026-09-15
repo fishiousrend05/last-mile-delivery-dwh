@@ -24,8 +24,16 @@ models:
         description: "Trạng thái đơn hàng"
         tests:
           - accepted_values:
-              values: ['delivered', 'shipped', 'canceled', 'unavailable', 'invoiced', 'processing', 'created', 'approved']
-
+              arguments:
+                values:
+                  - 'delivered'
+                  - 'shipped'
+                  - 'canceled'
+                  - 'unavailable'
+                  - 'invoiced'
+                  - 'processing'
+                  - 'created'
+                  - 'approved'
 
   - name: stg_olist__order_items
     columns:
@@ -63,6 +71,7 @@ models:
         tests:
           - unique
           - not_null
+
   - name: stg_olist__order_payments
     columns:
       - name: order_id

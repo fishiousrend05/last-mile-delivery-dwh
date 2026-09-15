@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: stg_external__weather_daily
+    description: >
+      Dữ liệu thời tiết lịch sử theo zone/ngày từ Open-Meteo Historical Weather API.
+      LƯU Ý: tính đến thời điểm viết model này, weather_ingestion_flow vẫn đang chạy
+      (chưa is_complete = True) — chỉ chạy reconciliation/coi model này "đóng" sau khi
+      Phase 1 xác nhận đã lấy đủ toàn bộ zone.
+    columns:
+      - name: zone_id
+        tests:
+          - not_null
+      - name: weather_date
+        tests:
+          - not_null
+      - name: temp_avg_c
+        tests:
+          - not_null
+
+  - name: stg_external__holidays
+    description: "Ngày nghỉ lễ Brazil từ Nager.Date, đã gắn holiday_impact_tier tính sẵn từ Python seed generator."
+    columns:
+      - name: holiday_date
+        tests:
+          - not_null
+      - name: holiday_impact_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values:
+                  - 'Tier_1_Mega_Boost'
+                  - 'Tier_2_High_Boost'
+                  - 'Tier_3_Neutral'
+                  - 'Tier_4_Mild_Drop'
+                  - 'Tier_5_Severe_Drop'
+
+  - name: stg_external__commercial_events
+    description: "Sự kiện thương mại tự định nghĩa (Black Friday, Mother's Day...), ưu tiên hơn Public Holiday khi trùng ngày."
+    columns:
+      - name: event_date
+        tests:
+          - not_null
+      - name: commercial_event_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values:
+                  - 'Tier_1_Mega_Boost'
+                  - 'Tier_2_High_Boost'
+                  - 'Tier_3_Neutral'
+                  - 'Tier_4_Mild_Drop'
+                  - 'Tier_5_Severe_Drop'
+
+  - name: stg_external__zone_centroids
+    description: "Tọa độ trung tâm của mỗi H3 zone (resolution 5), tính từ olist_geolocation thật."
+    columns:
+      - name: zone_id
+        tests:
+          - unique
+          - not_null
