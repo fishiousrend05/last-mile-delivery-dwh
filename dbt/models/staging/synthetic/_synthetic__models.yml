@@ -1,0 +1,50 @@
+version: 2
+
+models:
+  - name: stg_synthetic__drivers
+    description: "Danh sách tài xế mô phỏng (Faker), nguồn cho snapshot SCD2 dim_driver."
+    columns:
+      - name: driver_id
+        tests:
+          - unique
+          - not_null
+      - name: home_zone_id
+        tests:
+          - not_null
+      - name: driver_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'inactive']
+
+  - name: stg_synthetic__delivery_attempts
+    description: "Mỗi dòng = 1 lần thử giao hàng mô phỏng cho 1 đơn hàng, neo vào order_id thật."
+    columns:
+      - name: attempt_id
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        tests:
+          - not_null
+      - name: attempt_number
+        tests:
+          - not_null
+      - name: attempt_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['success', 'failed']
+
+  - name: stg_synthetic__failed_reasons
+    description: "Danh mục lý do giao hàng thất bại, tự định nghĩa (không có nguồn thật tương ứng trong Olist)."
+    columns:
+      - name: failed_reason_id
+        tests:
+          - unique
+          - not_null
+      - name: failed_reason_category
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['customer', 'operations', 'external']
