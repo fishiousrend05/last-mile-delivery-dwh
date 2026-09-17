@@ -3,10 +3,9 @@ version: 2
 models:
   - name: stg_external__weather_daily
     description: >
-      Dữ liệu thời tiết lịch sử theo zone/ngày từ Open-Meteo Historical Weather API.
-      LƯU Ý: tính đến thời điểm viết model này, weather_ingestion_flow vẫn đang chạy
-      (chưa is_complete = True) — chỉ chạy reconciliation/coi model này "đóng" sau khi
-      Phase 1 xác nhận đã lấy đủ toàn bộ zone.
+      Dữ liệu thời tiết lịch sử theo zone/ngày từ Open-Meteo. Đã dedupe theo (zone_id, date)
+      do checkpoint resume gây trùng lặp. Phủ 6.813/6.853 zone (~99.4%); 40 zone không có
+      trạm quan trắc lịch sử (biển/rừng sâu) — giới hạn dữ liệu đã biết, chấp nhận được.
     columns:
       - name: zone_id
         tests:
@@ -17,6 +16,11 @@ models:
       - name: temp_avg_c
         tests:
           - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - zone_id
+            - weather_date
 
   - name: stg_external__holidays
     description: "Ngày nghỉ lễ Brazil từ Nager.Date, đã gắn holiday_impact_tier tính sẵn từ Python seed generator."
