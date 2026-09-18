@@ -1,17 +1,43 @@
-with order_items as (
-    select * from {{ ref('stg_olist__order_items') }}
-),
+version: 2
 
-aggregated as (
-    select
-        order_id,
-        sum(price) as total_price,
-        sum(freight_value) as total_freight,
-        count(*) as item_count
-    from order_items
-    group by order_id
-)
+models:
+  - name: int_order_items_aggregated
+    description: >
+      Order-item grain rolled up to order grain (price/freight/item count).
+      Feeds int_order_lifecycle; kept as its own model so it's independently
+      testable/reusable (grain change from item -> order).
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments: # Bắt buộc phải có từ khóa này ở dbt 1.12+
+                to: ref('stg_olist__orders')
+                field: order_id
 
-select * from aggregated
-
-
+  - name: int_order_lifecycle
+    description: >
+      CORE-layer order lifecycle model. Grain: 1 row per order.
+      Full-lifecycle + last-mile + estimated-delivery metrics, zone
+      (via zip_zone_mapping seed) and delivery-moment weather enrichment.
+      Weather fields are intentionally NULL for orders without
+      order_delivered_customer_at.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: is_eligible_flag
+        description: "KPI #2 (Last-Mile Completion Rate) denominator — carrier_at IS NOT NULL"
+      - name: is_successful_flag
+        description: "KPI #2 numerator — eligible AND status='delivered' AND customer_at IS NOT NULL"
+      - name: is_unresolved_outcome_flag
+        description: "Known Olist data limitation — orphan shipped-state orders (~1.13% of eligible), confirmed not right-censoring"
+      - name: zone_id
+        description: "Resolved via zip_zone_mapping seed (customer zip_code_prefix -> H3 zone)"
+      - name: temp_avg_c
+        tests:
+          - not_null:
+              config:
+                where: "order_status = 'delivered'"
