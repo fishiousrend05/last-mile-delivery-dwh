@@ -1,7 +1,5 @@
 with orders as (
     select * from {{ ref('stg_olist__orders') }}
-    where order_purchase_at >= '2017-01-01'::timestamptz
-    and order_purchase_at < '2018-09-01'::timestamptz
 ),
 
 customers as (
