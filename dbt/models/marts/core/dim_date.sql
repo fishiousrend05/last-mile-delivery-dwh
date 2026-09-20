@@ -1,3 +1,10 @@
+{{ config(
+    materialized='table',
+    indexes=[
+        {'columns': ['full_date'], 'type': 'btree'}
+    ]
+) }}
+
 with date_spine as (
     select generate_series(
         '2016-01-01'::date,

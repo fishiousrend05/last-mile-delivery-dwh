@@ -1,0 +1,120 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: >
+      Calendar dimension, full range 2016-01-01 to 2018-12-31 (covers the
+      entire Olist dataset span, NOT limited to CLEAN_WINDOW). Role-playing
+      dimension — joined 5x in fact_order_lifecycle (purchase/approved/
+      carrier/delivered/estimated). is_clean_window_flag carries the
+      2017-01-01–2018-08-31 KPI reporting baseline as a filter attribute,
+      not a data-scope limit.
+    columns:
+      - name: date_key
+        tests:
+          - unique
+          - not_null
+      - name: full_date
+        tests:
+          - unique
+          - not_null
+      - name: holiday_impact_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['Tier_1_High', 'Tier_2_Medium', 'Tier_3_Neutral']
+      - name: commercial_event_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['Tier_1_High', 'Tier_2_Medium', 'Tier_3_Neutral']
+      - name: is_clean_window_flag
+        description: "True for 2017-01-01 <= full_date < 2018-09-01 — single source of truth for the KPI reporting baseline"
+
+  - name: dim_zone
+    description: >
+      Zone dimension built from the zone_centroids seed (H3 resolution 5).
+      zone_label is a cosmetic SYNTHETIC identifier, not sourced from Olist.
+    columns:
+      - name: zone_key
+        tests:
+          - unique
+          - not_null
+      - name: zone_id
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_weather
+    description: >
+      Daily weather per zone (Open-Meteo). weather_severity_bucket is
+      per-zone percentile-based (P90/P95 on temp_avg_c and precipitation_mm),
+      not a fixed absolute threshold — backed by Brazilian climate-extremes
+      literature (R95p/R99p, TX90p-style indices). 'Unknown' bucket applies
+      when a zone has fewer than 30 weather observations (percentile unstable).
+      wind_speed is NOT included — Phase 1 known limitation (weather_extractor.py
+      did not request wind_speed_10m_max from Open-Meteo).
+    columns:
+      - name: weather_key
+        tests:
+          - unique
+          - not_null
+      - name: zone_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_zone')
+                field: zone_key
+      - name: date_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: weather_severity_bucket
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['Low', 'Medium', 'High', 'Unknown']
+
+  - name: fact_order_lifecycle
+    description: >
+      CORE fact — grain: 1 row per order. Resolves surrogate keys via
+      dim_zone/dim_date/dim_weather (role-playing dim_date joined 5x for
+      the 5 lifecycle timestamps). delivery_weather_key is intentionally
+      NULL for orders without a customer delivery date.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_zone_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_zone')
+                field: zone_key
+      - name: purchase_date_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: delivered_date_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: delivery_weather_key
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_weather')
+                field: weather_key
+      - name: is_eligible_flag
+        description: "KPI #2 (Last-Mile Completion Rate) denominator — carrier_at IS NOT NULL"
+      - name: is_successful_flag
+        description: "KPI #2 numerator"
+      - name: is_unresolved_outcome_flag
+        description: "Known Olist data limitation — orphan shipped-state orders (~1.13% of eligible), confirmed not right-censoring"
