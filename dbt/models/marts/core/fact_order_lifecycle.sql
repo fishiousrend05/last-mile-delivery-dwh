@@ -1,5 +1,28 @@
 with lifecycle as (
-    select * from {{ ref('int_order_lifecycle') }}
+
+    select l.*
+    from {{ ref('int_order_lifecycle') }} as l
+
+    {% if is_incremental() %}
+
+    where 
+    -- 1. Cập nhật các đơn hàng cũ đang có sự thay đổi (chưa giao & chưa hủy)
+    l.order_id in (
+        select order_id
+        from {{ this }}
+        where delivered_date_key is null
+          and order_status not in ('canceled', 'unavailable')
+    )
+
+    -- 2. Thêm các đơn hàng mới hoàn toàn (dùng NOT EXISTS thay vì NOT IN để chạy nhanh hơn)
+    or not exists (
+        select 1 
+        from {{ this }} t 
+        where t.order_id = l.order_id
+    )
+
+    {% endif %}
+
 ),
 
 zones as (
