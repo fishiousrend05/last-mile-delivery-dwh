@@ -1,976 +1,513 @@
 """
-ingestion/tests/test_generators.py
-
-Unit tests cho ingestion/generators/synthetic_generator.py.
-
-Mục tiêu:
-    - Kiểm tra deterministic behavior của Faker + NumPy seed.
-    - Kiểm tra business rules của synthetic drivers.
-    - Kiểm tra mapping customer zip -> H3 zone.
-    - Kiểm tra order -> zone mapping và loại order không map được.
-    - Kiểm tra delivery_attempts được neo đúng vào Olist thật.
-    - Kiểm tra attempt sequence, timestamp, driver assignment.
-    - Kiểm tra failed_reason_id chỉ xuất hiện trên failed attempt.
-    - Kiểm tra weather / holiday / commercial event lookup.
-    - Không gọi API thật, không cần PostgreSQL.
-
-Đây là UNIT TEST.
-E2E với dataset Olist thật sẽ được thực hiện riêng sau khi toàn bộ
-unit test suite pass.
+Test cho phiên bản mới của synthetic_generator.py — chỉ bao phần THAY ĐỔI/THÊM MỚI:
+    - danh mục failed_reason khớp dbt seed, CATEGORY_WEIGHTS thật sự được dùng
+    - weather lookup vector hóa (ngữ nghĩa giống bản iterrows cũ)
+    - ưu tiên Commercial Event > Public Holiday, bỏ NaN tier
+    - chọn driver 3 bậc (zone -> state -> global)
+    - zone lấy từ seed zip_zone_mapping (giữ số 0 đầu, raise khi seed hỏng / nhân dòng)
+    - validate_delivery_attempts() bắt được dữ liệu sai
+    - end-to-end: kết quả tất định, neo đúng Olist, metadata JSON-safe
+Không cần Postgres/API thật. Test cũ trong test_generators.py: xem ghi chú bàn giao.
 """
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import pytest
 
-from ingestion.generators.synthetic_generator import (
-    FAILED_REASONS,
-    HIRE_DATE_END,
-    HIRE_DATE_START,
-    SIMULATION_HEAVY_RAIN_MM,
-    TIER_RISK_BONUS,
-    build_zip_to_zone_map,
-    generate_delivery_attempts,
-    generate_drivers,
-    map_orders_to_zone,
-)
-from ingestion.utils.geo import latlng_to_h3
+from ingestion.generators import synthetic_generator as sg
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-# ============================================================================
-# Helpers
-# ============================================================================
-
-def make_orders_df() -> pd.DataFrame:
-    """Tạo orders tối thiểu cho các test delivery_attempts."""
+# ---------------------------------------------------------------------------
+# Dữ liệu mẫu nhỏ
+# ---------------------------------------------------------------------------
+def _make_zones(n: int = 40) -> pd.DataFrame:
+    rng = np.random.default_rng(11)
     return pd.DataFrame(
         {
-            "order_id": ["O1", "O2", "O3", "O4"],
-            "customer_id": ["C1", "C2", "C3", "C4"],
-            "order_status": [
-                "delivered",
-                "delivered",
-                "shipped",
-                "cancelled",
-            ],
-            "order_delivered_carrier_date": pd.to_datetime(
-                [
-                    "2017-01-10",
-                    "2017-02-10",
-                    "2017-03-10",
-                    None,
-                ]
-            ),
-            "order_delivered_customer_date": pd.to_datetime(
-                [
-                    "2017-01-15",
-                    "2017-02-12",
-                    None,
-                    None,
-                ]
-            ),
-            "order_estimated_delivery_date": pd.to_datetime(
-                [
-                    "2017-01-13",
-                    "2017-02-10",
-                    "2017-03-15",
-                    None,
-                ]
-            ),
-            "zone_id": [
-                "ZONE_A",
-                "ZONE_A",
-                "ZONE_A",
-                "ZONE_A",
-            ],
+            "zone_id": [f"z{i:03d}" for i in range(n)],
+            "point_count": rng.integers(1, 200, n),
+            "dominant_state": rng.choice(["SP", "RJ", "MG"], n),
         }
     )
 
 
-def make_drivers_df() -> pd.DataFrame:
-    """
-    Driver pool tối thiểu nhưng đủ để test:
-
-        - cùng zone với order
-        - active
-        - hire_date trước attempt date
-    """
-    return pd.DataFrame(
+def _make_orders(zones: pd.DataFrame, n: int = 500, seed: int = 5) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    purchase = pd.Timestamp("2017-03-01") + pd.to_timedelta(rng.integers(0, 300, n), unit="D")
+    carrier = purchase + pd.to_timedelta(rng.integers(1, 5, n), unit="D")
+    delivered = (
+        carrier
+        + pd.to_timedelta(rng.integers(1, 20, n), unit="D")
+        + pd.to_timedelta(rng.integers(0, 86400, n), unit="s")
+    )
+    df = pd.DataFrame(
         {
-            "driver_id": ["DRV0001", "DRV0002"],
-            "full_name": ["Driver One", "Driver Two"],
-            "vehicle_type": ["motorcycle", "car"],
-            "zone_id": ["ZONE_A", "ZONE_A"],
-            "hire_date": pd.to_datetime(
-                ["2015-06-01", "2015-07-01"]
-            ),
-            "status": ["active", "active"],
+            "order_id": [f"o{i:05d}" for i in range(n)],
+            "customer_id": [f"c{i:05d}" for i in range(n)],
+            "order_status": rng.choice(["delivered", "shipped", "canceled"], n, p=[0.88, 0.07, 0.05]),
+            "order_delivered_carrier_date": carrier,
+            "order_delivered_customer_date": delivered,
+            "order_estimated_delivery_date": purchase + pd.to_timedelta(rng.integers(8, 25, n), unit="D"),
+            "zone_id": rng.choice(zones["zone_id"], n),
+        }
+    )
+    df.loc[rng.random(n) < 0.05, "order_delivered_carrier_date"] = pd.NaT
+    df.loc[rng.random(n) < 0.02, "order_delivered_customer_date"] = pd.NaT
+    df.loc[df["order_status"] != "delivered", "order_delivered_customer_date"] = pd.NaT
+    return df
+
+
+def _make_weather(zones: pd.DataFrame) -> pd.DataFrame:
+    days = pd.date_range("2017-02-01", "2018-03-01")
+    grid = pd.MultiIndex.from_product([zones["zone_id"], days], names=["zone_id", "date"]).to_frame(index=False)
+    rng = np.random.default_rng(3)
+    grid["precipitation_mm"] = np.where(rng.random(len(grid)) < 0.12, 45.0, 2.0)
+    return grid
+
+
+def _write_seeds(tmp_path: Path) -> tuple[Path, Path]:
+    hp, ep = tmp_path / "holidays.csv", tmp_path / "events.csv"
+    pd.DataFrame(
+        {"date": ["2017-04-21", "2017-09-07"], "holiday_impact_tier": ["Tier_1_Mega_Boost", "Tier_3_Neutral"]}
+    ).to_csv(hp, index=False)
+    pd.DataFrame(
+        {"date": ["2017-11-24"], "commercial_event_tier": ["Tier_1_Mega_Boost"]}
+    ).to_csv(ep, index=False)
+    return hp, ep
+
+
+@pytest.fixture
+def world(tmp_path):
+    zones = _make_zones()
+    drivers = sg.generate_drivers(zones, n_drivers=60, seed=42).df
+    hp, ep = _write_seeds(tmp_path)
+    return {
+        "zones": zones,
+        "drivers": drivers,
+        "orders": _make_orders(zones),
+        "weather": _make_weather(zones),
+        "holidays": hp,
+        "events": ep,
+    }
+
+
+def _run(world, **overrides):
+    kwargs = dict(
+        weather_df=world["weather"],
+        holidays_seed_path=world["holidays"],
+        commercial_events_seed_path=world["events"],
+        seed=42,
+    )
+    kwargs.update(overrides)
+    return sg.generate_delivery_attempts(world["orders"], world["drivers"], **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Hằng số / danh mục
+# ---------------------------------------------------------------------------
+def test_failed_reason_catalog_matches_dbt_seed():
+    seed_path = REPO_ROOT / "dbt" / "seeds" / "failed_reasons.csv"
+    if not seed_path.exists():
+        pytest.skip(f"{seed_path} not found")
+    seed = pd.read_csv(seed_path, dtype=str)
+    col = lambda *names: next(n for n in names if n in seed.columns)  # noqa: E731
+    seed_rows = {
+        (r[col("failed_reason_id")].strip(), r[col("failed_reason_category", "category")].strip(),
+         r[col("failed_reason_name", "reason_name")].strip())
+        for _, r in seed.iterrows()
+    }
+    gen_rows = {(r["failed_reason_id"], r["category"], r["reason_name"]) for r in sg.FAILED_REASONS}
+    assert gen_rows == seed_rows
+
+
+def test_check_constants_rejects_weights_not_summing_to_one(monkeypatch):
+    monkeypatch.setattr(sg, "CATEGORY_WEIGHTS", {"customer": 0.5, "operations": 0.25, "external": 0.05})
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        sg._check_constants()
+
+
+def test_pick_failed_reason_actually_uses_category_weights(monkeypatch):
+    monkeypatch.setattr(sg, "CATEGORY_WEIGHTS", {"customer": 0.0, "operations": 1.0, "external": 0.0})
+    rng = np.random.default_rng(0)
+    picks = {sg._pick_failed_reason(rng, False) for _ in range(200)}
+    assert picks <= set(sg._OPERATIONS_REASONS) and picks
+
+
+def test_fr09_never_picked_without_severe_weather():
+    rng = np.random.default_rng(1)
+    picks = [sg._pick_failed_reason(rng, False) for _ in range(3000)]
+    assert sg.REASON_EXTREME_WEATHER not in picks
+    picks_severe = [sg._pick_failed_reason(rng, True) for _ in range(3000)]
+    assert sg.REASON_EXTREME_WEATHER in picks_severe
+
+
+# ---------------------------------------------------------------------------
+# Weather lookup
+# ---------------------------------------------------------------------------
+def _reference_weather_lookup(weather_df):
+    """Bản iterrows cũ — dùng làm đối chứng ngữ nghĩa."""
+    lookup = {}
+    for _, row in weather_df.iterrows():
+        key = (row["zone_id"], pd.Timestamp(row["date"]).normalize())
+        lookup[key] = row["precipitation_mm"] > sg.SIMULATION_HEAVY_RAIN_MM
+    return lookup
+
+
+def test_weather_lookup_matches_reference_semantics():
+    rng = np.random.default_rng(2)
+    n = 3000
+    w = pd.DataFrame(
+        {
+            "zone_id": rng.choice(["a", "b", "c"], n),
+            "date": pd.to_datetime("2017-01-01") + pd.to_timedelta(rng.integers(0, 40, n), unit="D"),
+            "precipitation_mm": rng.uniform(0, 60, n),
+        }
+    )
+    w.loc[rng.random(n) < 0.05, "precipitation_mm"] = np.nan
+    w.loc[rng.random(n) < 0.05, "precipitation_mm"] = 20.0  # đúng ngưỡng: KHÔNG phải mưa lớn
+    w = pd.concat([w, w.head(300)], ignore_index=True)  # trùng (zone, date), kể cả trùng khác giá trị
+
+    got = sg._build_weather_severity_lookup(w)
+    ref = _reference_weather_lookup(w)
+    assert all(got.get(k, False) == v for k, v in ref.items())
+    assert set(got) == {k for k, v in ref.items() if v}
+
+
+def test_weather_lookup_empty_inputs():
+    assert sg._build_weather_severity_lookup(None) == {}
+    assert sg._build_weather_severity_lookup(pd.DataFrame(columns=["zone_id", "date", "precipitation_mm"])) == {}
+
+
+# ---------------------------------------------------------------------------
+# Holiday / commercial event
+# ---------------------------------------------------------------------------
+def test_commercial_event_takes_priority_over_holiday():
+    d = pd.Timestamp("2017-12-25")
+    holiday = {d: "Tier_1_Mega_Boost"}
+    event = {d: "Tier_3_Neutral"}
+    assert sg._event_risk_bonus(d, holiday, event) == 0.0  # event thắng, dù holiday là Mega_Boost
+    assert sg._event_risk_bonus(d, holiday, {}) == sg.TIER_RISK_BONUS["Tier_1_Mega_Boost"]
+    assert sg._event_risk_bonus(d, {}, {d: "Tier_2_High_Boost"}) == sg.TIER_RISK_BONUS["Tier_2_High_Boost"]
+    assert sg._event_risk_bonus(pd.Timestamp("2017-01-01"), holiday, event) == 0.0
+
+
+def test_date_tier_lookup_drops_nan_tiers(tmp_path):
+    p = tmp_path / "events.csv"
+    pd.DataFrame(
+        {"date": ["2017-11-24", "2017-11-25"], "commercial_event_tier": ["Tier_1_Mega_Boost", np.nan]}
+    ).to_csv(p, index=False)
+    lookup = sg._build_date_tier_lookup(p, "commercial_event_tier")
+    assert list(lookup) == [pd.Timestamp("2017-11-24")]
+
+
+def test_date_tier_lookup_missing_seed_returns_empty(tmp_path):
+    assert sg._build_date_tier_lookup(tmp_path / "nope.csv", "holiday_impact_tier") == {}
+
+
+# ---------------------------------------------------------------------------
+# Chọn driver
+# ---------------------------------------------------------------------------
+def _driver_fixture():
+    hired = pd.Timestamp("2016-01-01")
+    late = pd.Timestamp("2017-06-01")
+    drivers = pd.DataFrame(
+        {
+            "driver_id": ["D1", "D2", "D3", "D4"],
+            "zone_id": ["z1", "z2", "z3", "z4"],
+            "hire_date": [hired, hired, hired, late],
+            "status": ["active", "active", "active", "active"],
+        }
+    )
+    zone_state = {"z1": "SP", "z2": "SP", "z3": "RJ", "z4": "RJ", "z9": "SP", "z8": "AM"}
+    return drivers, zone_state
+
+
+def test_pick_driver_three_tiers():
+    drivers, zone_state = _driver_fixture()
+    lookup = sg._build_driver_lookup(drivers)
+    state_lookup = sg._build_state_driver_lookup(drivers, zone_state)
+    rng = np.random.default_rng(0)
+    date = pd.Timestamp("2017-03-01")
+
+    assert sg._pick_driver_tiered("z1", date, lookup, rng, state_lookup, zone_state) == ("D1", sg.DRIVER_TIER_ZONE)
+    # z9 không có tài xế nhưng cùng bang SP với D1/D2 -> bậc state
+    driver, tier = sg._pick_driver_tiered("z9", date, lookup, rng, state_lookup, zone_state)
+    assert tier == sg.DRIVER_TIER_STATE and driver in {"D1", "D2"}
+    # z8 (bang AM) không có tài xế nào cùng bang -> bậc global
+    driver, tier = sg._pick_driver_tiered("z8", date, lookup, rng, state_lookup, zone_state)
+    assert tier == sg.DRIVER_TIER_GLOBAL and driver in {"D1", "D2", "D3"}
+
+
+def test_pick_driver_respects_hire_date_and_returns_none_when_empty():
+    drivers, zone_state = _driver_fixture()
+    lookup = sg._build_driver_lookup(drivers)
+    rng = np.random.default_rng(0)
+    # D4 (z4) chưa được tuyển vào 2017-03-01 -> rơi xuống global, không bao giờ là D4
+    for _ in range(50):
+        driver, tier = sg._pick_driver_tiered("z4", pd.Timestamp("2017-03-01"), lookup, rng)
+        assert driver != "D4" and tier == sg.DRIVER_TIER_GLOBAL
+    assert sg._pick_driver_tiered("z1", pd.Timestamp("2010-01-01"), lookup, rng) == (None, sg.DRIVER_TIER_NONE)
+
+
+def test_pick_driver_without_state_args_is_two_tier_like_before():
+    drivers, zone_state = _driver_fixture()
+    lookup = sg._build_driver_lookup(drivers)
+    rng = np.random.default_rng(0)
+    _driver, tier = sg._pick_driver_tiered("z9", pd.Timestamp("2017-03-01"), lookup, rng)
+    assert tier == sg.DRIVER_TIER_GLOBAL  # không truyền state -> bỏ qua bậc bang
+
+
+def test_inactive_drivers_are_never_pooled():
+    drivers, zone_state = _driver_fixture()
+    drivers.loc[0, "status"] = "inactive"
+    assert "D1" not in {d for pool in sg._build_driver_lookup(drivers).values() for d, _ in pool}
+    assert "D1" not in {d for pool in sg._build_state_driver_lookup(drivers, zone_state).values() for d, _ in pool}
+
+
+# ---------------------------------------------------------------------------
+# zip -> zone
+# ---------------------------------------------------------------------------
+def test_normalize_zip_pads_and_handles_types():
+    s = pd.Series([1001, "1001", "01001", "1001.0", np.nan, 99999])
+    out = sg._normalize_zip(s).tolist()
+    assert out[:4] == ["01001"] * 4
+    assert pd.isna(out[4])
+    assert out[5] == "99999"
+
+
+def test_load_zip_to_zone_map_keeps_leading_zeros(tmp_path):
+    p = tmp_path / "zip_zone_mapping.csv"
+    p.write_text("zip_code_prefix,zone_id\n01001,zA\n1002,zB\n99999,zC\n")
+    m = sg.load_zip_to_zone_map(p)
+    assert dict(zip(m["customer_zip_code_prefix"], m["zone_id"])) == {"01001": "zA", "01002": "zB", "99999": "zC"}
+
+
+def test_load_zip_to_zone_map_raises_on_conflicting_zone(tmp_path):
+    p = tmp_path / "zip_zone_mapping.csv"
+    p.write_text("zip_code_prefix,zone_id\n01001,zA\n1001,zB\n")
+    with pytest.raises(ValueError, match="more than one zone_id"):
+        sg.load_zip_to_zone_map(p)
+
+
+def test_load_zip_to_zone_map_tolerates_exact_duplicate_rows(tmp_path):
+    p = tmp_path / "zip_zone_mapping.csv"
+    p.write_text("zip_code_prefix,zone_id\n01001,zA\n1001,zA\n")
+    assert len(sg.load_zip_to_zone_map(p)) == 1
+
+
+def test_load_zip_to_zone_map_requires_columns(tmp_path):
+    p = tmp_path / "zip_zone_mapping.csv"
+    p.write_text("zip,zone\n01001,zA\n")
+    with pytest.raises(ValueError, match="missing column"):
+        sg.load_zip_to_zone_map(p)
+
+
+def test_map_orders_to_zone_joins_int_and_str_zips_and_drops_unmapped():
+    orders = pd.DataFrame({"order_id": ["o1", "o2", "o3"], "customer_id": ["c1", "c2", "c3"]})
+    customers = pd.DataFrame(
+        {"customer_id": ["c1", "c2", "c3"], "customer_zip_code_prefix": [1001, 1002, 77777]}  # int, mất số 0 đầu
+    )
+    mapping = pd.DataFrame({"customer_zip_code_prefix": ["01001", "01002"], "zone_id": ["zA", "zB"]})
+    out = sg.map_orders_to_zone(orders, customers, mapping)
+    assert dict(zip(out["order_id"], out["zone_id"])) == {"o1": "zA", "o2": "zB"}
+
+
+def test_map_orders_to_zone_raises_instead_of_fanning_out():
+    orders = pd.DataFrame({"order_id": ["o1"], "customer_id": ["c1"]})
+    dup_customers = pd.DataFrame({"customer_id": ["c1", "c1"], "customer_zip_code_prefix": ["01001", "01001"]})
+    mapping = pd.DataFrame({"customer_zip_code_prefix": ["01001"], "zone_id": ["zA"]})
+    with pytest.raises(ValueError, match="changed row count"):
+        sg.map_orders_to_zone(orders, dup_customers, mapping)
+
+
+def test_build_zone_state_map():
+    zones = pd.DataFrame({"zone_id": ["a", "b", "c"], "dominant_state": ["SP", None, "RJ"]})
+    assert sg.build_zone_state_map(zones) == {"a": "SP", "c": "RJ"}
+    assert sg.build_zone_state_map(zones.drop(columns="dominant_state")) == {}
+
+
+# ---------------------------------------------------------------------------
+# End-to-end
+# ---------------------------------------------------------------------------
+def test_generate_delivery_attempts_is_deterministic_and_anchored(world):
+    a = _run(world)
+    b = _run(world)
+    pd.testing.assert_frame_equal(a.df, b.df)
+    assert list(a.df.columns) == sg.ATTEMPT_COLUMNS
+
+    df = a.df
+    o = world["orders"].set_index("order_id")
+    # quy tắc #1: đơn chưa rời kho không có attempt
+    no_carrier = set(o.index[o["order_delivered_carrier_date"].isna()])
+    assert not (set(df["order_id"]) & no_carrier)
+    # quy tắc #2a/#2b: attempt cuối success <=> delivered + có customer_date, và khớp timestamp
+    last = df.sort_values(["order_id", "attempt_number"]).groupby("order_id").tail(1).set_index("order_id")
+    delivered_ok = (o["order_status"] == "delivered") & o["order_delivered_customer_date"].notna()
+    for oid, row in last.iterrows():
+        assert (row["attempt_status"] == "success") == bool(delivered_ok[oid])
+        if row["attempt_status"] == "success":
+            assert row["attempt_timestamp"] == o.loc[oid, "order_delivered_customer_date"]
+    # có cả attempt fail lẫn success (tránh test "đúng vì rỗng")
+    assert {"success", "failed"} <= set(df["attempt_status"])
+
+
+def test_generate_delivery_attempts_metadata_is_json_serializable(world):
+    res = _run(world, zone_state_map=sg.build_zone_state_map(world["zones"]))
+    meta = json.loads(json.dumps(res.metadata))
+    assert meta["simulation_params"]["heavy_rain_mm"] == sg.SIMULATION_HEAVY_RAIN_MM
+    assert meta["n_attempts_generated"] == len(res.df)
+    da = meta["driver_assignment"]
+    assert da["zone"] + da["state"] + da["global"] + da["none"] == len(res.df)
+    assert da["state_fallback_enabled"] is True
+
+
+def test_state_fallback_only_changes_driver_and_never_below_zone_tier(world):
+    without = _run(world)
+    with_state = _run(world, zone_state_map=sg.build_zone_state_map(world["zones"]))
+    # cùng attempt, cùng ngày, cùng trạng thái — chỉ driver_id (và các lần rút RNG sau đó) có thể khác
+    assert len(without.df) > 0 and len(with_state.df) > 0
+    same_zone_a = without.metadata["driver_assignment"]["pct_same_zone"]
+    same_zone_b = with_state.metadata["driver_assignment"]["pct_same_zone"]
+    assert abs(same_zone_a - same_zone_b) < 0.05  # bậc 1 không bị bậc state làm thay đổi đáng kể
+    assert with_state.metadata["driver_assignment"]["state"] > 0
+
+
+def test_generation_without_weather_and_seeds_still_valid(world, tmp_path):
+    res = sg.generate_delivery_attempts(
+        world["orders"],
+        world["drivers"],
+        weather_df=None,
+        holidays_seed_path=tmp_path / "missing_h.csv",
+        commercial_events_seed_path=tmp_path / "missing_e.csv",
+    )
+    assert sg.REASON_EXTREME_WEATHER not in set(res.df["failed_reason_id"].dropna())
+    assert res.metadata["n_severe_weather_zone_days"] == 0
+
+
+def test_no_attempts_yields_empty_frame_with_columns(world):
+    orders = world["orders"].copy()
+    orders["order_delivered_carrier_date"] = pd.NaT
+    res = sg.generate_delivery_attempts(orders, world["drivers"], weather_df=None)
+    assert res.df.empty and list(res.df.columns) == sg.ATTEMPT_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# validate_delivery_attempts phải BẮT được dữ liệu sai
+# ---------------------------------------------------------------------------
+def _validation_inputs(world):
+    res = _run(world)
+    orders = world["orders"].copy()
+    for c in ("order_delivered_carrier_date", "order_delivered_customer_date", "order_estimated_delivery_date"):
+        orders[c] = pd.to_datetime(orders[c])
+    lookup = sg._build_weather_severity_lookup(world["weather"])
+    return res.df.copy(), orders, world["drivers"].copy(), lookup
+
+
+def test_validator_passes_on_clean_output(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    stats = sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+    assert stats["n_attempts"] == len(attempts)
+
+
+def _multi_attempt_order(attempts):
+    counts = attempts.groupby("order_id").size()
+    return counts[counts >= 2].index[0]
+
+
+def test_validator_catches_duplicate_attempt_id(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    attempts.loc[attempts.index[1], "attempt_id"] = attempts.loc[attempts.index[0], "attempt_id"]
+    with pytest.raises(ValueError, match="duplicate attempt_id"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+def test_validator_catches_success_before_last_attempt(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    oid = _multi_attempt_order(attempts)
+    first = attempts[(attempts["order_id"] == oid) & (attempts["attempt_number"] == 1)].index[0]
+    attempts.loc[first, ["attempt_status", "failed_reason_id"]] = ["success", None]
+    with pytest.raises(ValueError, match="not the last attempt"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+def test_validator_catches_fr09_without_heavy_rain(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    failed = attempts[attempts["attempt_status"] == "failed"]
+    dry = failed[
+        [(z, t.normalize()) not in lookup for z, t in zip(failed["zone_id"], failed["attempt_timestamp"])]
+    ]
+    attempts.loc[dry.index[0], "failed_reason_id"] = sg.REASON_EXTREME_WEATHER
+    with pytest.raises(ValueError, match="FR09"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+def test_validator_catches_driver_hired_after_attempt(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    victim = attempts["driver_id"].dropna().iloc[0]
+    drivers.loc[drivers["driver_id"] == victim, "hire_date"] = pd.Timestamp("2030-01-01")
+    with pytest.raises(ValueError, match="hired after"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+def test_validator_catches_outcome_disagreeing_with_order_status(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    oid = attempts.loc[attempts["attempt_status"] == "success", "order_id"].iloc[0]
+    orders.loc[orders["order_id"] == oid, "order_status"] = "canceled"
+    with pytest.raises(ValueError, match="rule 2a"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+def test_validator_catches_attempt_for_order_that_never_shipped(world):
+    attempts, orders, drivers, lookup = _validation_inputs(world)
+    oid = attempts["order_id"].iloc[0]
+    orders.loc[orders["order_id"] == oid, "order_delivered_carrier_date"] = pd.NaT
+    with pytest.raises(ValueError, match="rule 1"):
+        sg.validate_delivery_attempts(attempts, orders, drivers, lookup)
+
+
+# ---------------------------------------------------------------------------
+# main(): dùng seed zip_zone_mapping, không cần geolocation
+# ---------------------------------------------------------------------------
+def test_main_uses_zip_zone_mapping_seed_and_ignores_geolocation(world, tmp_path):
+    zones = world["zones"]
+    zones.to_csv(tmp_path / "zone_centroids.csv", index=False)
+
+    # zip nguồn ở dạng số (mất số 0 đầu) — seed dùng chuỗi 5 ký tự
+    zips = [1000 + i for i in range(len(zones))]
+    pd.DataFrame(
+        {"zip_code_prefix": [f"{z:05d}" for z in zips], "zone_id": zones["zone_id"]}
+    ).to_csv(tmp_path / "zip_zone_mapping.csv", index=False)
+
+    orders = world["orders"].drop(columns="zone_id")
+    zip_by_zone = dict(zip(zones["zone_id"], zips))
+    customers = pd.DataFrame(
+        {
+            "customer_id": orders["customer_id"],
+            "customer_zip_code_prefix": world["orders"]["zone_id"].map(zip_by_zone),
         }
     )
 
-
-# ============================================================================
-# generate_drivers()
-# ============================================================================
-
-class TestGenerateDrivers:
-    def test_generates_requested_number_of_drivers(self, sample_zone_centroids_df):
-        result = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=50,
-            seed=42,
-        )
-
-        assert len(result.df) == 50
-        assert result.table_name == "drivers"
-        assert result.metadata["n_drivers"] == 50
-        assert result.metadata["seed"] == 42
-
-    def test_driver_ids_are_unique_and_sequential(self, sample_zone_centroids_df):
-        result = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=10,
-            seed=42,
-        )
-
-        assert result.df["driver_id"].is_unique
-        assert result.df["driver_id"].tolist() == [
-            f"DRV{i:04d}" for i in range(1, 11)
-        ]
-
-    def test_driver_output_has_expected_columns(self, sample_zone_centroids_df):
-        result = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=20,
-            seed=42,
-        )
-
-        expected_columns = {
-            "driver_id",
-            "full_name",
-            "vehicle_type",
-            "zone_id",
-            "hire_date",
-            "status",
-        }
-
-        assert set(result.df.columns) == expected_columns
-
-    def test_driver_domain_values_are_valid(self, sample_zone_centroids_df):
-        result = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=100,
-            seed=42,
-        )
-
-        assert result.df["vehicle_type"].isin(
-            ["motorcycle", "car", "van", "bicycle"]
-        ).all()
-
-        assert result.df["status"].isin(
-            ["active", "inactive"]
-        ).all()
-
-        assert result.df["zone_id"].isin(
-            sample_zone_centroids_df["zone_id"]
-        ).all()
-
-    def test_driver_hire_dates_are_before_olist_period(
-        self,
-        sample_zone_centroids_df,
-    ):
-        result = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=100,
-            seed=42,
-        )
-
-        assert result.df["hire_date"].min() >= HIRE_DATE_START
-        assert result.df["hire_date"].max() < HIRE_DATE_END
-        assert result.df["hire_date"].max() < pd.Timestamp("2016-09-01")
-
-    def test_driver_generation_is_deterministic(self, sample_zone_centroids_df):
-        result_1 = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=50,
-            seed=42,
-        )
-
-        result_2 = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=50,
-            seed=42,
-        )
-
-        pd.testing.assert_frame_equal(
-            result_1.df,
-            result_2.df,
-        )
-
-    def test_different_seed_changes_generated_data(
-        self,
-        sample_zone_centroids_df,
-    ):
-        result_1 = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=50,
-            seed=42,
-        )
-
-        result_2 = generate_drivers(
-            sample_zone_centroids_df,
-            n_drivers=50,
-            seed=99,
-        )
-
-        assert not result_1.df.equals(result_2.df)
-
-
-# ============================================================================
-# build_zip_to_zone_map()
-# ============================================================================
-
-class TestBuildZipToZoneMap:
-    def test_builds_one_zone_per_zip_prefix(self):
-        geolocation_df = pd.DataFrame(
-            {
-                "geolocation_zip_code_prefix": [
-                    1000,
-                    1000,
-                    2000,
-                    2000,
-                ],
-                "geolocation_lat": [
-                    -23.5500,
-                    -23.5600,
-                    -22.9000,
-                    -22.9100,
-                ],
-                "geolocation_lng": [
-                    -46.6300,
-                    -46.6400,
-                    -43.2000,
-                    -43.2100,
-                ],
-            }
-        )
-
-        result = build_zip_to_zone_map(geolocation_df)
-
-        assert len(result) == 2
-        assert set(result.columns) == {
-            "customer_zip_code_prefix",
-            "zone_id",
-        }
-
-        assert result["customer_zip_code_prefix"].is_unique
-        assert result["zone_id"].notna().all()
-
-    def test_zone_id_is_h3_resolution_5(self):
-        geolocation_df = pd.DataFrame(
-            {
-                "geolocation_zip_code_prefix": [1000],
-                "geolocation_lat": [-23.5500],
-                "geolocation_lng": [-46.6300],
-            }
-        )
-
-        result = build_zip_to_zone_map(geolocation_df)
-
-        expected_zone = latlng_to_h3(
-            -23.5500,
-            -46.6300,
-            resolution=5,
-        )
-
-        assert result.loc[0, "zone_id"] == expected_zone
-
-    def test_multiple_points_of_same_zip_are_averaged(self):
-        geolocation_df = pd.DataFrame(
-            {
-                "geolocation_zip_code_prefix": [1000, 1000],
-                "geolocation_lat": [-23.0, -24.0],
-                "geolocation_lng": [-46.0, -44.0],
-            }
-        )
-
-        result = build_zip_to_zone_map(geolocation_df)
-
-        expected_zone = latlng_to_h3(
-            -23.5,
-            -45.0,
-            resolution=5,
-        )
-
-        assert result.loc[0, "zone_id"] == expected_zone
-
-
-# ============================================================================
-# map_orders_to_zone()
-# ============================================================================
-
-class TestMapOrdersToZone:
-    def test_maps_order_through_customer_zip(self):
-        orders_df = pd.DataFrame(
-            {
-                "order_id": ["O1", "O2"],
-                "customer_id": ["C1", "C2"],
-            }
-        )
-
-        customers_df = pd.DataFrame(
-            {
-                "customer_id": ["C1", "C2"],
-                "customer_zip_code_prefix": [1000, 2000],
-            }
-        )
-
-        zip_to_zone_df = pd.DataFrame(
-            {
-                "customer_zip_code_prefix": [1000, 2000],
-                "zone_id": ["ZONE_A", "ZONE_B"],
-            }
-        )
-
-        result = map_orders_to_zone(
-            orders_df,
-            customers_df,
-            zip_to_zone_df,
-        )
-
-        assert len(result) == 2
-
-        mapping = dict(
-            zip(result["order_id"], result["zone_id"])
-        )
-
-        assert mapping == {
-            "O1": "ZONE_A",
-            "O2": "ZONE_B",
-        }
-
-    def test_unmapped_orders_are_excluded(self):
-        orders_df = pd.DataFrame(
-            {
-                "order_id": ["O1", "O2"],
-                "customer_id": ["C1", "C2"],
-            }
-        )
-
-        customers_df = pd.DataFrame(
-            {
-                "customer_id": ["C1", "C2"],
-                "customer_zip_code_prefix": [1000, 9999],
-            }
-        )
-
-        zip_to_zone_df = pd.DataFrame(
-            {
-                "customer_zip_code_prefix": [1000],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = map_orders_to_zone(
-            orders_df,
-            customers_df,
-            zip_to_zone_df,
-        )
-
-        assert len(result) == 1
-        assert result.iloc[0]["order_id"] == "O1"
-
-    def test_original_order_columns_are_preserved(self):
-        orders_df = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "customer_id": ["C1"],
-                "order_status": ["delivered"],
-            }
-        )
-
-        customers_df = pd.DataFrame(
-            {
-                "customer_id": ["C1"],
-                "customer_zip_code_prefix": [1000],
-            }
-        )
-
-        zip_to_zone_df = pd.DataFrame(
-            {
-                "customer_zip_code_prefix": [1000],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = map_orders_to_zone(
-            orders_df,
-            customers_df,
-            zip_to_zone_df,
-        )
-
-        assert "order_id" in result.columns
-        assert "customer_id" in result.columns
-        assert "order_status" in result.columns
-        assert "zone_id" in result.columns
-
-
-# ============================================================================
-# generate_delivery_attempts()
-# ============================================================================
-
-class TestGenerateDeliveryAttempts:
-    def test_output_has_expected_table_name(self):
-        orders = make_orders_df()
-        drivers = make_drivers_df()
-
-        result = generate_delivery_attempts(
-            orders,
-            drivers,
-            seed=42,
-        )
-
-        assert result.table_name == "delivery_attempts"
-
-    def test_orders_without_carrier_date_generate_no_attempts(self):
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["created"],
-                "order_delivered_carrier_date": [pd.NaT],
-                "order_delivered_customer_date": [pd.NaT],
-                "order_estimated_delivery_date": [
-                    pd.Timestamp("2017-01-15")
-                ],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        assert result.df.empty
-        assert result.metadata["n_orders_excluded_no_carrier_date"] == 1
-
-    def test_delivered_order_has_final_success_attempt(self):
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["delivered"],
-                "order_delivered_carrier_date": [
-                    pd.Timestamp("2017-01-10")
-                ],
-                "order_delivered_customer_date": [
-                    pd.Timestamp("2017-01-15")
-                ],
-                "order_estimated_delivery_date": [
-                    pd.Timestamp("2017-01-13")
-                ],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        attempts = result.df
-
-        assert not attempts.empty
-
-        final_attempt = attempts.iloc[-1]
-
-        assert final_attempt["order_id"] == "O1"
-        assert final_attempt["attempt_status"] == "success"
-        assert final_attempt["attempt_timestamp"] == pd.Timestamp(
-            "2017-01-15"
-        )
-        assert pd.isna(final_attempt["failed_reason_id"])
-
-    def test_final_attempt_timestamp_matches_real_olist_date(self):
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["delivered"],
-                "order_delivered_carrier_date": [
-                    pd.Timestamp("2017-05-01")
-                ],
-                "order_delivered_customer_date": [
-                    pd.Timestamp("2017-05-08")
-                ],
-                "order_estimated_delivery_date": [
-                    pd.Timestamp("2017-05-05")
-                ],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        attempts = result.df
-
-        assert attempts.iloc[-1]["attempt_timestamp"] == pd.Timestamp(
-            "2017-05-08"
-        )
-
-    def test_non_delivered_order_has_only_failed_attempts(self):
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["shipped"],
-                "order_delivered_carrier_date": [
-                    pd.Timestamp("2017-05-10")
-                ],
-                "order_delivered_customer_date": [pd.NaT],
-                "order_estimated_delivery_date": [
-                    pd.Timestamp("2017-05-15")
-                ],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        assert not result.df.empty
-        assert (result.df["attempt_status"] == "failed").all()
-        assert result.df["failed_reason_id"].notna().all()
-
-    def test_attempt_numbers_are_contiguous_per_order(self):
-        result = generate_delivery_attempts(
-            make_orders_df(),
-            make_drivers_df(),
-            seed=42,
-        )
-
-        for order_id, group in result.df.groupby("order_id"):
-            expected = list(range(1, len(group) + 1))
-
-            assert group["attempt_number"].tolist() == expected
-
-    def test_attempt_ids_are_unique(self):
-        result = generate_delivery_attempts(
-            make_orders_df(),
-            make_drivers_df(),
-            seed=42,
-        )
-
-        assert result.df["attempt_id"].is_unique
-
-    def test_attempt_dates_never_precede_carrier_date(self):
-        orders = make_orders_df()
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        carrier_dates = (
-            orders[
-                [
-                    "order_id",
-                    "order_delivered_carrier_date",
-                ]
-            ]
-            .dropna()
-            .set_index("order_id")[
-                "order_delivered_carrier_date"
-            ]
-        )
-
-        for _, row in result.df.iterrows():
-            carrier_date = carrier_dates[row["order_id"]]
-
-            assert row["attempt_timestamp"] > carrier_date
-
-    def test_driver_is_active_and_same_zone(self):
-        orders = make_orders_df()
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        drivers = make_drivers_df().set_index("driver_id")
-
-        for _, attempt in result.df.iterrows():
-            driver = drivers.loc[attempt["driver_id"]]
-
-            assert driver["status"] == "active"
-            assert driver["zone_id"] == attempt["zone_id"]
-
-    def test_driver_was_hired_before_attempt(self):
-        orders = make_orders_df()
-
-        result = generate_delivery_attempts(
-            orders,
-            make_drivers_df(),
-            seed=42,
-        )
-
-        drivers = make_drivers_df().set_index("driver_id")
-
-        for _, attempt in result.df.iterrows():
-            driver = drivers.loc[attempt["driver_id"]]
-
-            assert driver["hire_date"] <= attempt["attempt_timestamp"]
-
-    def test_failed_reason_only_exists_on_failed_attempts(self):
-        result = generate_delivery_attempts(
-            make_orders_df(),
-            make_drivers_df(),
-            seed=42,
-        )
-
-        failed = result.df[
-            result.df["attempt_status"] == "failed"
-        ]
-        successful = result.df[
-            result.df["attempt_status"] == "success"
-        ]
-
-        assert failed["failed_reason_id"].notna().all()
-
-        if not successful.empty:
-            assert successful["failed_reason_id"].isna().all()
-
-    def test_generated_attempts_are_deterministic(self):
-        orders = make_orders_df()
-        drivers = make_drivers_df()
-
-        result_1 = generate_delivery_attempts(
-            orders,
-            drivers,
-            seed=42,
-        )
-
-        result_2 = generate_delivery_attempts(
-            orders,
-            drivers,
-            seed=42,
-        )
-
-        pd.testing.assert_frame_equal(
-            result_1.df,
-            result_2.df,
-        )
-
-    def test_different_seed_changes_attempt_simulation(self):
-        orders = make_orders_df()
-        drivers = make_drivers_df()
-
-        result_1 = generate_delivery_attempts(
-            orders,
-            drivers,
-            seed=42,
-        )
-
-        result_2 = generate_delivery_attempts(
-            orders,
-            drivers,
-            seed=99,
-        )
-
-        assert not result_1.df.equals(result_2.df)
-
-    def test_metadata_matches_generated_output(self):
-        result = generate_delivery_attempts(
-            make_orders_df(),
-            make_drivers_df(),
-            seed=42,
-        )
-
-        assert result.metadata["source_name"] == "synthetic"
-        assert result.metadata["table_name"] == "delivery_attempts"
-        assert result.metadata["n_orders_input"] == 4
-        assert result.metadata["n_attempts_generated"] == len(result.df)
-        assert result.metadata["seed"] == 42
-
-
-# ============================================================================
-# Risk / lookup helpers
-# ============================================================================
-
-class TestGeneratorRiskHelpers:
-    def test_heavy_rain_threshold_is_explicit(self):
-        """
-        Guard against accidental change of the simulation threshold.
-
-        Đây là heuristic riêng của synthetic simulation, không phải
-        weather_severity_bucket chính thức trong dbt.
-        """
-        assert SIMULATION_HEAVY_RAIN_MM == 20.0
-
-    def test_event_risk_bonus_configuration_is_non_negative(self):
-        assert TIER_RISK_BONUS["Tier_1_Mega_Boost"] == 0.30
-        assert TIER_RISK_BONUS["Tier_2_High_Boost"] == 0.15
-
-        assert all(
-            bonus >= 0
-            for bonus in TIER_RISK_BONUS.values()
-        )
-
-    def test_failed_reason_catalog_has_unique_ids(self):
-        ids = [
-            reason["failed_reason_id"]
-            for reason in FAILED_REASONS
-        ]
-
-        assert len(ids) == len(set(ids))
-
-    def test_failed_reason_catalog_has_expected_categories(self):
-        categories = {
-            reason["category"]
-            for reason in FAILED_REASONS
-        }
-
-        assert categories == {
-            "customer",
-            "operations",
-            "external",
-        }
-
-
-# ============================================================================
-# Weather-conditioned failed_reason (bổ sung — quy tắc nghiệp vụ quan trọng
-# nhất đã thống nhất: "thời tiết cực đoan" (FR09) CHỈ được chọn khi weather
-# thật xấu tại đúng zone/ngày, KHÔNG phải random thuần)
-# ============================================================================
-
-class TestFailedReasonWeatherConditioning:
-    def test_fr09_never_chosen_without_severe_weather(self):
-        import numpy as np
-        from ingestion.generators.synthetic_generator import _pick_failed_reason
-
-        rng = np.random.default_rng(123)
-        reasons = [_pick_failed_reason(rng, is_weather_severe=False) for _ in range(3000)]
-        assert "FR09" not in reasons
-
-    def test_fr09_can_be_chosen_with_severe_weather(self):
-        import numpy as np
-        from ingestion.generators.synthetic_generator import _pick_failed_reason
-
-        rng = np.random.default_rng(456)
-        reasons = [_pick_failed_reason(rng, is_weather_severe=True) for _ in range(3000)]
-        assert "FR09" in reasons
-
-    def test_category_weights_approximate_70_25_5(self):
-        import numpy as np
-        from ingestion.generators.synthetic_generator import (
-            _CUSTOMER_REASONS,
-            _OPERATIONS_REASONS,
-            _pick_failed_reason,
-        )
-
-        rng = np.random.default_rng(789)
-        n = 5000
-        reasons = [_pick_failed_reason(rng, is_weather_severe=False) for _ in range(n)]
-
-        n_customer = sum(1 for r in reasons if r in _CUSTOMER_REASONS)
-        n_ops = sum(1 for r in reasons if r in _OPERATIONS_REASONS)
-
-        assert 0.65 < n_customer / n < 0.75
-        assert 0.20 < n_ops / n < 0.30
-
-    def test_severe_weather_at_delivery_date_can_produce_fr09_end_to_end(self):
-        """
-        Test end-to-end qua generate_delivery_attempts() (không chỉ hàm nội
-        bộ _pick_failed_reason) — dựng weather_df có mưa >20mm đúng zone/ngày
-        của 1 đơn trễ nặng, chạy nhiều seed để xác nhận FR09 CÓ THỂ xuất hiện.
-        """
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["delivered"],
-                "order_delivered_carrier_date": [pd.Timestamp("2017-06-01")],
-                "order_delivered_customer_date": [pd.Timestamp("2017-06-20")],  # trễ nặng
-                "order_estimated_delivery_date": [pd.Timestamp("2017-06-10")],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-        # Mưa lớn (>20mm) suốt cả khoảng attempt có thể xảy ra
-        weather_df = pd.DataFrame(
-            {
-                "zone_id": ["ZONE_A"] * 20,
-                "date": pd.date_range("2017-06-01", periods=20),
-                "precipitation_mm": [35.0] * 20,
-            }
-        )
-
-        found_fr09 = False
-        for seed in range(100):
-            result = generate_delivery_attempts(orders, make_drivers_df(), weather_df=weather_df, seed=seed)
-            if (result.df["failed_reason_id"] == "FR09").any():
-                found_fr09 = True
-                break
-        assert found_fr09, "FR09 phải có thể xuất hiện khi weather thật xấu tại đúng zone/ngày"
-
-    def test_no_weather_df_disables_severe_weather_reason_end_to_end(self):
-        """weather_df=None -> is_weather_severe luôn False -> FR09 không bao giờ xuất hiện."""
-        orders = pd.DataFrame(
-            {
-                "order_id": ["O1"],
-                "order_status": ["delivered"],
-                "order_delivered_carrier_date": [pd.Timestamp("2017-06-01")],
-                "order_delivered_customer_date": [pd.Timestamp("2017-06-20")],
-                "order_estimated_delivery_date": [pd.Timestamp("2017-06-10")],
-                "zone_id": ["ZONE_A"],
-            }
-        )
-        for seed in range(20):
-            result = generate_delivery_attempts(orders, make_drivers_df(), weather_df=None, seed=seed)
-            assert (result.df["failed_reason_id"] != "FR09").all()
-
-
-# ============================================================================
-# holiday_impact_tier / commercial_event_tier risk bonus (bổ sung)
-# ============================================================================
-
-class TestEventRiskBonus:
-    def test_event_risk_bonus_direct(self):
-        from ingestion.generators.synthetic_generator import _event_risk_bonus
-
-        holiday_lookup = {pd.Timestamp("2017-11-24"): "Tier_1_Mega_Boost"}
-        event_lookup = {pd.Timestamp("2017-03-12"): "Tier_2_High_Boost"}
-
-        assert _event_risk_bonus(pd.Timestamp("2017-11-24"), holiday_lookup, event_lookup) == 0.30
-        assert _event_risk_bonus(pd.Timestamp("2017-03-12"), holiday_lookup, event_lookup) == 0.15
-        # Ngày neutral / không có trong lookup -> khong co risk bonus
-        assert _event_risk_bonus(pd.Timestamp("2017-05-01"), holiday_lookup, event_lookup) == 0.0
-
-    def test_build_date_tier_lookup_reads_seed_file(self, tmp_path):
-        from ingestion.generators.synthetic_generator import _build_date_tier_lookup
-
-        seed_path = tmp_path / "holidays.csv"
-        pd.DataFrame(
-            {
-                "date": ["2017-11-24"],
-                "local_name": ["Black Friday"],
-                "holiday_impact_tier": ["Tier_1_Mega_Boost"],
-            }
-        ).to_csv(seed_path, index=False)
-
-        lookup = _build_date_tier_lookup(seed_path, "holiday_impact_tier")
-        assert lookup[pd.Timestamp("2017-11-24")] == "Tier_1_Mega_Boost"
-
-    def test_missing_seed_file_returns_empty_lookup_gracefully(self, tmp_path):
-        from ingestion.generators.synthetic_generator import _build_date_tier_lookup
-
-        lookup = _build_date_tier_lookup(tmp_path / "khong_ton_tai.csv", "holiday_impact_tier")
-        assert lookup == {}
-
-    def test_high_tier_date_increases_attempt_failure_rate(self, tmp_path):
-        """
-        So sánh tỷ lệ đơn CHỈ có 1 attempt (giao trót lọt lần đầu) giữa ngày
-        Tier_1_Mega_Boost (rủi ro cao) vs ngày Tier_3_Neutral — kỳ vọng
-        Tier_1 có tỷ lệ multi-attempt CAO HƠN rõ rệt qua nhiều seed.
-        """
-        holidays_path = tmp_path / "holidays.csv"
-        pd.DataFrame(columns=["date", "local_name", "holiday_impact_tier"]).to_csv(
-            holidays_path, index=False
-        )
-        events_path = tmp_path / "commercial_events.csv"
-        pd.DataFrame(
-            {
-                "date": ["2017-11-24"],
-                "commercial_event_name": ["Black_Friday_Week_2017"],
-                "commercial_event_tier": ["Tier_1_Mega_Boost"],
-            }
-        ).to_csv(events_path, index=False)
-
-        def make_order(delivered_date):
-            return pd.DataFrame(
-                {
-                    "order_id": ["O1"],
-                    "order_status": ["delivered"],
-                    "order_delivered_carrier_date": [pd.Timestamp(delivered_date) - pd.Timedelta(days=5)],
-                    "order_delivered_customer_date": [pd.Timestamp(delivered_date)],
-                    "order_estimated_delivery_date": [pd.Timestamp(delivered_date) - pd.Timedelta(days=1)],
-                    "zone_id": ["ZONE_A"],
-                }
-            )
-
-        n_multi_boost = 0
-        n_multi_neutral = 0
-        trials = 40
-        for seed in range(trials):
-            r_boost = generate_delivery_attempts(
-                make_order("2017-11-24"), make_drivers_df(),
-                holidays_seed_path=holidays_path, commercial_events_seed_path=events_path, seed=seed,
-            )
-            if len(r_boost.df) > 1:
-                n_multi_boost += 1
-
-            r_neutral = generate_delivery_attempts(
-                make_order("2017-05-15"), make_drivers_df(),
-                holidays_seed_path=holidays_path, commercial_events_seed_path=events_path, seed=seed,
-            )
-            if len(r_neutral.df) > 1:
-                n_multi_neutral += 1
-
-        assert n_multi_boost > n_multi_neutral, (
-            f"Ky vong Tier_1_Mega_Boost ({n_multi_boost}/{trials} multi-attempt) "
-            f"> Tier_3_Neutral ({n_multi_neutral}/{trials})"
-        )
-
-
-# ============================================================================
-# Driver fallback khi zone không còn tài xế active hợp lệ (bổ sung)
-# ============================================================================
-
-class TestDriverFallback:
-    def test_falls_back_to_global_pool_when_zone_has_no_active_driver(self):
-        from ingestion.generators.synthetic_generator import _build_driver_lookup, _pick_driver
-        import numpy as np
-
-        # ZONE_A không có tài xế nào cả -> phai fallback sang ZONE_B
-        drivers_df = pd.DataFrame(
-            {
-                "driver_id": ["DRV0001"],
-                "full_name": ["Driver One"],
-                "vehicle_type": ["car"],
-                "zone_id": ["ZONE_B"],
-                "hire_date": [pd.Timestamp("2015-01-01")],
-                "status": ["active"],
-            }
-        )
-        lookup = _build_driver_lookup(drivers_df)
-        rng = np.random.default_rng(1)
-
-        chosen = _pick_driver("ZONE_A", pd.Timestamp("2017-06-01"), lookup, rng)
-        assert chosen == "DRV0001"  # fallback đúng sang pool toàn cục
-
-    def test_returns_none_when_absolutely_no_active_driver_exists(self):
-        from ingestion.generators.synthetic_generator import _build_driver_lookup, _pick_driver
-        import numpy as np
-
-        drivers_df = pd.DataFrame(
-            {
-                "driver_id": ["DRV0001"],
-                "full_name": ["Driver One"],
-                "vehicle_type": ["car"],
-                "zone_id": ["ZONE_A"],
-                "hire_date": [pd.Timestamp("2020-01-01")],  # tuyển SAU ngày attempt
-                "status": ["active"],
-            }
-        )
-        lookup = _build_driver_lookup(drivers_df)
-        rng = np.random.default_rng(1)
-
-        chosen = _pick_driver("ZONE_A", pd.Timestamp("2017-06-01"), lookup, rng)
-        assert chosen is None
+    drivers_res, attempts_res = sg.main(
+        zone_centroids_path=tmp_path / "zone_centroids.csv",
+        zip_zone_mapping_path=tmp_path / "zip_zone_mapping.csv",
+        holidays_seed_path=world["holidays"],
+        commercial_events_seed_path=world["events"],
+        orders_df=orders,
+        customers_df=customers,
+        weather_df=world["weather"],
+        geolocation_df=pd.DataFrame(),  # DEPRECATED: bị bỏ qua, không được làm vỡ luồng cũ
+        n_drivers=60,
+    )
+    assert len(drivers_res.df) == 60
+    # zone của attempt phải đúng bằng zone gốc (qua seed), không phải zone tính từ toạ độ
+    expected_zone = world["orders"].set_index("order_id")["zone_id"]
+    got_zone = attempts_res.df.drop_duplicates("order_id").set_index("order_id")["zone_id"]
+    assert (got_zone == expected_zone.loc[got_zone.index]).all()
+    assert attempts_res.metadata["driver_assignment"]["state_fallback_enabled"] is True
