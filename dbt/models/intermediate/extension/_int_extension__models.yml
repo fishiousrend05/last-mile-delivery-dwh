@@ -1,0 +1,43 @@
+# dbt/models/intermediate/extension/_int_extension__models.yml
+
+version: 2
+
+models:
+  - name: int_driver_versions
+    description: >
+      1 dòng/version SCD2 của driver (chuẩn hóa từ snap_driver). Version đầu
+      tiên của mỗi driver có row_effective_date = hire_date (không phải
+      dbt_valid_from thô) — xem giải thích trong model. Dùng để build
+      dim_driver và để point-in-time join driver_key trong fact_delivery_attempts.
+    columns:
+      - name: driver_version_id
+        description: Surrogate key — grain của bảng này (1 dòng/version).
+        tests:
+          - unique
+          - not_null
+      - name: driver_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_synthetic__drivers')
+              field: driver_id
+      - name: version_number
+        tests:
+          - not_null
+      - name: row_effective_date
+        tests:
+          - not_null
+      - name: row_end_date
+        tests:
+          - not_null
+      - name: driver_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'inactive']
+      - name: is_current
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "row_effective_date <= row_end_date"

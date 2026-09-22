@@ -22,12 +22,12 @@ models:
         tests:
           - accepted_values:
               arguments:
-                values: ['Tier_1_High', 'Tier_2_Medium', 'Tier_3_Neutral']
+                values: ['Tier_1_Mega_Boost', 'Tier_2_High_Boost', 'Tier_3_Neutral', 'Tier_4_Mild_Drop', 'Tier_5_Severe_Drop']
       - name: commercial_event_tier
         tests:
           - accepted_values:
               arguments:
-                values: ['Tier_1_High', 'Tier_2_Medium', 'Tier_3_Neutral']
+                values: ['Tier_1_Mega_Boost', 'Tier_2_High_Boost', 'Tier_3_Neutral', 'Tier_4_Mild_Drop', 'Tier_5_Severe_Drop']
       - name: is_clean_window_flag
         description: "True for 2017-01-01 <= full_date < 2018-09-01 — single source of truth for the KPI reporting baseline"
 

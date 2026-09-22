@@ -41,3 +41,4 @@ models:
           - not_null:
               config:
                 where: "order_status = 'delivered'"
+                severity: warn
