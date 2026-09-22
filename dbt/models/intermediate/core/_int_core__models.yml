@@ -42,3 +42,7 @@ models:
               config:
                 where: "order_status = 'delivered'"
                 severity: warn
+      - name: last_mile_duration_quality
+        tests:
+          - accepted_values:
+              values: ['missing_timestamp', 'negative_duration', 'zero_duration', 'valid']

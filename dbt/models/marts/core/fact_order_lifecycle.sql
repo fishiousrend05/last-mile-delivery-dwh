@@ -66,6 +66,7 @@ final as (
         l.is_eligible_flag,
         l.is_successful_flag,
         l.is_unresolved_outcome_flag,
+        l.last_mile_duration_quality,
 
         l.total_price,
         l.total_freight,

@@ -60,6 +60,16 @@ final as (
         -- last-mile metric (chặng carrier -> customer)
         extract(epoch from (o.order_delivered_customer_at - o.order_delivered_carrier_at)) / 86400.0
             as last_mile_delivery_days,
+        
+        case    
+            when o.order_delivered_carrier_at is null or o.order_delivered_customer_at is null 
+                then 'missing_timestamp'    
+            when o.order_delivered_customer_at < o.order_delivered_carrier_at 
+                then 'negative_duration'    
+            when o.order_delivered_customer_at = o.order_delivered_carrier_at 
+                then 'zero_duration'    
+            else 'valid'
+        end as last_mile_duration_quality,
 
         -- estimated-delivery metrics
         extract(epoch from (o.order_delivered_customer_at - o.order_estimated_delivery_at)) / 86400.0
