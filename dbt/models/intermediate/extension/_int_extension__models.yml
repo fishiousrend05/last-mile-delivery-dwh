@@ -41,3 +41,54 @@ models:
     tests:
       - dbt_utils.expression_is_true:
           expression: "row_effective_date <= row_end_date"
+
+  - name: int_delivery_attempts
+    description: >
+      1 dòng/lần giao mô phỏng — enrich stg_synthetic__delivery_attempts với
+      flag first/final attempt, driver point-in-time (qua int_driver_versions)
+      và weather tại thời điểm attempt (khác delivery date của
+      fact_order_lifecycle).
+    columns:
+      - name: attempt_id
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('int_order_lifecycle')
+              field: order_id
+      - name: zone_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zone')
+              field: zone_id
+      - name: attempt_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['success', 'failed']
+      - name: is_final_attempt_flag
+        tests:
+          - not_null
+      - name: driver_version_id
+        tests:
+          - not_null:
+              config:
+                severity: warn   # NULL chỉ có thể xảy ra nếu không tìm được version driver nào khớp range — bất thường, cần điều tra chứ không nên chặn build
+          - relationships:
+              to: ref('int_driver_versions')
+              field: driver_version_id
+      - name: attempt_weather_key
+        tests:
+          - relationships:
+              to: ref('dim_weather')
+              field: weather_key
+              config:
+                where: "attempt_weather_key is not null"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['order_id', 'attempt_number']
