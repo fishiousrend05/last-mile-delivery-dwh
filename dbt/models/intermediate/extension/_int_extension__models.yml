@@ -92,3 +92,44 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: ['order_id', 'attempt_number']
+
+    
+
+
+  - name: int_driver_daily
+    description: >
+      1 dòng/driver_version × ngày lịch (2016-01-01 -> 2018-12-31), full
+      calendar coverage — ngày không hoạt động vẫn có dòng, total_attempts=0,
+      is_active_day=false. success_rate NULL (không phải 0) khi total=0.
+    columns:
+      - name: driver_id
+        tests:
+          - not_null
+      - name: driver_version_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('int_driver_versions')
+              field: driver_version_id
+      - name: date_day
+        tests:
+          - not_null
+      - name: total_attempts
+        tests:
+          - not_null
+      - name: is_active_day
+        tests:
+          - not_null
+      - name: success_rate
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                where: "success_rate is not null"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['driver_version_id', 'date_day']

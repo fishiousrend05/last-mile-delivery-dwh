@@ -52,3 +52,7 @@ seeds:
     zone_centroids:
       +column_types:
         zone_id: varchar
+
+vars:
+  dwh_start_date: "'2016-01-01'"
+  dwh_end_date: "'2018-12-31'"
