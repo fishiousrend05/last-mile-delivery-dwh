@@ -32,9 +32,9 @@ enriched as (
         (h.holiday_date is not null) as is_holiday,
         h.holiday_name,
         coalesce(h.holiday_impact_tier, 'Tier_3_Neutral') as holiday_impact_tier,
+        (ce.event_date is not null) as is_commercial_event,
         ce.commercial_event_name,
         coalesce(ce.commercial_event_tier, 'Tier_3_Neutral') as commercial_event_tier,
-        -- CLEAN_WINDOW: baseline dùng cho KPI reporting, KHÔNG giới hạn phạm vi dữ liệu của DWH
         (ds.full_date >= '2017-01-01' and ds.full_date < '2018-09-01') as is_clean_window_flag
     from date_spine ds
     left join holidays h
