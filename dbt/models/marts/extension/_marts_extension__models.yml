@@ -1,0 +1,42 @@
+# dbt/models/marts/extension/_marts_extension__models.yml
+
+version: 2
+
+models:
+  - name: dim_driver
+    description: >
+      SCD2 driver dimension (SYNTHETIC — driver_id/name/vehicle_type/
+      home_zone_id/hire_date/driver_status đều do Faker sinh, xem STM mục
+      A.3). 1 dòng/version. home_zone_key resolve qua dim_zone (outrigger),
+      home_zone_id giữ lại làm natural key tham chiếu/debug.
+    columns:
+      - name: driver_key
+        description: Surrogate key — PK của bảng này (1 dòng/version).
+        tests:
+          - unique
+          - not_null
+      - name: driver_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_synthetic__drivers')
+              field: driver_id
+      - name: home_zone_key
+        tests:
+          - relationships:
+              to: ref('dim_zone')
+              field: zone_key
+              config:
+                where: "home_zone_key is not null"
+      - name: driver_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'inactive']
+      - name: is_current
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['driver_id', 'version_number']
