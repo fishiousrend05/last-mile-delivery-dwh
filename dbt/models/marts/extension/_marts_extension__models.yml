@@ -40,3 +40,33 @@ models:
       - dbt_utils.unique_combination_of_columns:
           arguments:
             combination_of_columns: ['driver_id', 'version_number']
+
+  - name: dim_failed_reason
+    description: >
+      Catalog 9 lý do giao hàng thất bại (FR01-FR09, SYNTHETIC — xem STM mục
+      A.3). Không SCD, không versioned. failed_reason_category (customer/
+      operations/external) dùng để group ở KPI nhóm B và Q2/drill-down 4 —
+      cột này KHÔNG có trong bản STM gốc (STM cũ chỉ liệt kê failed_reason_id +
+      failed_reason_desc), đã bổ sung vì generator thực tế có phân loại 3
+      nhóm trọng số 70/25/5.
+    columns:
+      - name: failed_reason_key
+        tests:
+          - unique
+          - not_null
+      - name: failed_reason_id
+        tests:
+          - unique
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['FR01','FR02','FR03','FR04','FR05','FR06','FR07','FR08','FR09']
+      - name: failed_reason_category
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['customer', 'operations', 'external']
+      - name: failed_reason_desc
+        tests:
+          - not_null
