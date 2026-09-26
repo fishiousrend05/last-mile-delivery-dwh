@@ -21,6 +21,11 @@ models:
           - relationships:
               to: ref('stg_synthetic__drivers')
               field: driver_id
+      - name: driver_version_id
+        description: Natural key nối tới int_driver_versions/int_delivery_attempts — dùng để join fact, khác driver_key (hash).
+        tests:
+          - unique
+          - not_null
       - name: home_zone_key
         tests:
           - relationships:
@@ -70,3 +75,70 @@ models:
       - name: failed_reason_desc
         tests:
           - not_null
+  - name: fact_delivery_attempts
+    description: >
+      1 dòng/lần giao mô phỏng/order (SYNTHETIC, xem STM). weather_key resolve
+      theo ATTEMPT date (khác fact_order_lifecycle.delivery_weather_key dùng
+      delivery date) vì đây là thời tiết lúc CỐ GẮNG giao, kể cả lần thất bại.
+      Không có sla_risk_score, không có FR00 (xem model).
+    columns:
+      - name: attempt_id
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('fact_order_lifecycle')
+              field: order_id
+      - name: attempt_date_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+      - name: zone_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_zone')
+              field: zone_key
+      - name: driver_key
+        tests:
+          - not_null:
+              config:
+                severity: warn   # mirror int_delivery_attempts.driver_version_id (warn) — NULL hợp lệ khi generator không tìm được driver active nào tại thời điểm đó (hiếm, đầu kỳ dữ liệu)
+          - relationships:
+              to: ref('dim_driver')
+              field: driver_key
+              config:
+                where: "driver_key is not null"
+      - name: weather_key
+        tests:
+          - relationships:
+              to: ref('dim_weather')
+              field: weather_key
+              config:
+                where: "weather_key is not null"
+      - name: failed_reason_key
+        tests:
+          - relationships:
+              to: ref('dim_failed_reason')
+              field: failed_reason_key
+              config:
+                where: "failed_reason_key is not null"
+      - name: attempt_outcome
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['success', 'failed']
+      - name: is_final_attempt_flag
+        tests:
+          - not_null
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['order_id', 'attempt_number']
+      - dbt_utils.expression_is_true:
+          expression: "(attempt_outcome = 'failed') = (failed_reason_key is not null)"
