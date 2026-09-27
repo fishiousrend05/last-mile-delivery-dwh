@@ -142,3 +142,43 @@ models:
             combination_of_columns: ['order_id', 'attempt_number']
       - dbt_utils.expression_is_true:
           expression: "(attempt_outcome = 'failed') = (failed_reason_key is not null)"
+
+  - name: fact_driver_daily_kpi
+    description: >
+      Periodic snapshot — 1 dòng/driver_version × ngày lịch (full calendar
+      coverage, kể cả ngày inactive: total_attempts=0, is_active_day=false).
+      success_rate là tỷ lệ tại grain này, KHÔNG additive — dùng
+      SUM(successful_attempts)/SUM(total_attempts) khi rollup, không AVG.
+      avg_sla_risk_score KHÔNG có (đã bỏ khỏi schema từ Phase 1).
+    columns:
+      - name: driver_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_driver')
+              field: driver_key
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+      - name: total_attempts
+        tests:
+          - not_null
+      - name: is_active_day
+        tests:
+          - not_null
+      - name: success_rate
+        tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+                inclusive: true
+              config:
+                where: "success_rate is not null"
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['driver_key', 'date_key']
