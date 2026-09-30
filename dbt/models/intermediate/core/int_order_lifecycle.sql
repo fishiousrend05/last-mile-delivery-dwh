@@ -74,7 +74,16 @@ orders_demo as (
             else o.order_status
         end as order_status,
 
-        true as is_demo_masked_flag
+        case
+            when o.order_status = 'delivered'
+                 and (
+                     o.order_delivered_carrier_at > '{{ cutoff }}'::timestamptz
+                     or o.order_delivered_customer_at > '{{ cutoff }}'::timestamptz
+                 )
+                then true
+            else false
+        end as is_demo_masked_flag
+        
         {% else %}
         o.order_delivered_carrier_at,
         o.order_delivered_customer_at,

@@ -61,6 +61,7 @@ final as (
         w.weather_key as delivery_weather_key,
 
         l.order_status,
+        l.is_demo_masked_flag,
 
         l.approval_lag_hours,
         l.carrier_lag_days,
