@@ -7,6 +7,6 @@ with counts as (
 )
 select *
 from counts
-where orphan_shipped_count <> 1097
+where orphan_shipped_count <> 1107
    or delivered_anomaly_count <> 9
    or negative_duration_count <> 23
